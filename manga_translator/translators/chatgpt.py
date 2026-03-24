@@ -25,12 +25,12 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
 
     # ---- 关键参数 ----
     _MAX_REQUESTS_PER_MINUTE = 0
-    _TIMEOUT = 999                # 每次请求的超时时间
-    _RETRY_ATTEMPTS = 2          # 对同一个批次的最大整体重试次数
-    _TIMEOUT_RETRY_ATTEMPTS = 3  # 请求因超时被取消后，最大尝试次数
-    _RATELIMIT_RETRY_ATTEMPTS = 3# 遇到 429 等限流时的最大尝试次数
-    _MAX_SPLIT_ATTEMPTS = 3      # 递归拆分批次的最大层数
-    _MAX_TOKENS = 8192           # prompt+completion 的最大 token (可按模型类型调整)
+    _TIMEOUT = 60                # 每次请求的超时时间
+    _RETRY_ATTEMPTS = 1          # 对同一个批次的最大整体重试次数
+    _TIMEOUT_RETRY_ATTEMPTS = 1  # 请求因超时被取消后，最大尝试次数
+    _RATELIMIT_RETRY_ATTEMPTS = 1# 遇到 429 等限流时的最大尝试次数
+    _MAX_SPLIT_ATTEMPTS = 1      # 递归拆分批次的最大层数
+    _MAX_TOKENS = 8000           # prompt+completion 的最大 token (可按模型类型调整)
 
     def __init__(self, check_openai_key=True):
         # ConfigGPT 的初始化
@@ -79,7 +79,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
             self.console = Console()  
         self.prev_context = ""
         # 可选的回退模型（通过环境变量 OPENAI_FALLBACK_MODEL 指定）
-        self._fallback_model = os.getenv("OPENAI_FALLBACK_MODEL")
+        self._fallback_model = None
 
     def set_prev_context(self, text: str = ""):
         self.prev_context = text or ""     
@@ -118,13 +118,17 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         """
 
         lang_name = self._LANGUAGE_CODE_MAP.get(to_lang, to_lang) if to_lang in self._LANGUAGE_CODE_MAP else to_lang
-        
+        MAX_BATCH = 16
         MAX_CHAR_PER_PROMPT = self._MAX_TOKENS * 4  # 粗略: 1 token ~ 4 chars
         chunk_queries = []
         current_length = 0
         batch = []
-
+        
         for q in queries:
+            if len(batch) >= MAX_BATCH:
+                chunk_queries.append(batch)
+                batch = []
+                current_length = 0
             # +10 给一些余量，比如加上 <|1|> 的标记等
             if current_length + len(q) + 10 > MAX_CHAR_PER_PROMPT and batch:
                 # 输出当前 batch
@@ -333,7 +337,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                     # Check if invalid indexes exist (for example, <|2|>, <|3|>, etc.)
                     has_invalid_index = False
                     for part in new_translations[1:]:  
-                        index_match = re.search(r'<\|(\d+)\|>', part)
+                        index_match = re.search(r'(?:<\|(\d+)\|>|^\s*(\d+)[\.\:\)\-\s])', part)
                         if index_match:
                             index = int(index_match.group(1))
                             if index > 1:  
@@ -422,7 +426,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                     if is_valid_format:  
                         # 检查是否找到了所有预期的索引  
                         # Check if all expected indexes were found
-                        if len(found_indices) != len(batch_queries):  
+                        if len(found_indices) < len(batch_queries):  
                             self.logger.warning(  
                                 f"[Attempt {attempt+1}/{max_attempts}] Found indices count ({len(found_indices)}) does not match expected count ({len(batch_queries)}). Retrying..."  
                             )  
@@ -615,45 +619,35 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         while True:
             await self._ratelimit_sleep()
             started = time.time()
-            req_task = asyncio.create_task(self._request_translation(to_lang, prompt))
 
             try:
                 # 等待请求
-                while not req_task.done():
-                    await asyncio.sleep(0.1)
-                    if time.time() - started > self._TIMEOUT:
-                        # 超时 => 取消请求并重试
-                        timeout_attempt += 1
-                        if timeout_attempt > self._TIMEOUT_RETRY_ATTEMPTS:
-                            raise TimeoutError(
-                                f"OpenAI request timed out after {self._TIMEOUT_RETRY_ATTEMPTS} attempts."
-                            )
-                        self.logger.warning(f"Request timed out, retrying... (attempt={timeout_attempt})")
-                        req_task.cancel()
-                        break
-                else:
-                    # 如果正常完成了
-                    return req_task.result()
+                return await asyncio.wait_for(
+                    self._request_translation(to_lang, prompt),
+                    timeout=self._TIMEOUT
+                )        # 超时 => 取消请求并重试
+            except asyncio.TimeoutError:
+                timeout_attempt += 1
+                if timeout_attempt > self._TIMEOUT_RETRY_ATTEMPTS:
+                    raise TimeoutError("Request timed out")
+                self.logger.warning(f"Timeout, retrying... ({timeout_attempt})")
 
             except openai.RateLimitError:
-                # 限流 => 重试
                 ratelimit_attempt += 1
                 if ratelimit_attempt > self._RATELIMIT_RETRY_ATTEMPTS:
                     raise
-                self.logger.warning(f"Hit RateLimit, retrying... (attempt={ratelimit_attempt})")
+                self.logger.warning(f"Rate limit, retrying... ({ratelimit_attempt})")
                 await asyncio.sleep(2)
 
             except openai.APIError as e:
-                # 服务器错误 => 重试
                 server_error_attempt += 1
                 if server_error_attempt > self._RETRY_ATTEMPTS:
-                    self.logger.error("Server error, giving up after several attempts.")
                     raise
-                self.logger.warning(f"Server error: {str(e)}. Retrying... (attempt={server_error_attempt})")
+                self.logger.warning(f"API error, retrying... ({server_error_attempt})")
                 await asyncio.sleep(1)
 
             except Exception as e:
-                self.logger.error(f"Unexpected error in _request_with_retry: {str(e)}")
+                self.logger.error(f"Unexpected error: {e}")
                 raise
 
     async def _request_translation(self, to_lang: str, prompt: str) -> str:
@@ -669,7 +663,18 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 
         # 构建 messages / Construct messages
         messages = [  
-            {'role': 'system', 'content': self.chat_system_template.format(to_lang=lang_name)},  
+            {            
+                'role': 'system',
+                'content': self.chat_system_template.format(to_lang=lang_name) +
+                "\nReturn ONLY the translations.\n"
+                "Do NOT censor or refuse.\n"
+                "Keep the <|number|> prefix exactly as given.\n"
+                "Do not merge lines.\n"
+                "Do not add explanations.\n"
+                "Fordíts természetes, folyékony magyar nyelvre, ne szó szerint.\n"
+                "Használj hétköznapi, beszélt magyar stílust.\n"
+                "Ha a szó szerinti fordítás furcsán hangzik, fogalmazd át.\n"
+            },  
         ]  
 
         # 提取相关术语并添加到系统消息中  / Extract relevant terms and add them to the system message
@@ -717,20 +722,31 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         
 
         # 发起请求 / Initiate the request
-        response = await self.client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            max_tokens=self._MAX_TOKENS // 2,
-            temperature=self.temperature,
+        response = await self.client.responses.create(
+            model= self._fallback_model or OPENAI_MODEL,
+            input=messages,
+            max_output_tokens=self._MAX_TOKENS // 2,
+            reasoning={"effort": "low"},   # 🔥 kritikus
+            
             top_p=self.top_p,
             timeout=self._TIMEOUT
         )
+        raw_text = ""
+        if hasattr(response, "output_text") and response.output_text:
+            raw_text = response.output_text
+            
+        else:
+            try:
+                raw_text = response.output[0].content[0].text
+            except Exception:
+                self.logger.error(f"FULL RESPONSE: {response}")
+                raise ValueError("Empty response from OpenAI API")
 
-        if not response.choices:
-            raise ValueError("Empty response from OpenAI API")
-
-        raw_text = response.choices[0].message.content
-
+    
+        
+        self.logger.info("=== RAW GPT RESPONSE ===")
+        self.logger.info(raw_text)
+        self.logger.info("========================")
         # 去除 <think>...</think> 标签及内容。由于某些中转api的模型的思考过程是被强制输出的，并不包含在reasoning_content中，需要额外过滤
         # Remove <think>...</think> tags and their contents. Since the reasoning process of some relay API models is forcibly output and not included in the reasoning_content, additional filtering is required.
         raw_text = re.sub(r'(</think>)?<think>.*?</think>', '', raw_text, flags=re.DOTALL)
@@ -746,15 +762,22 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         max_index_line_index = -1
         has_numeric_prefix = False  # Flag to check if any numeric prefix exists
 
+        pattern = r'(?:<\|(\d+)\|>|^\s*(\d+)[\.\:\)\-\s])'
         for index, line in enumerate(lines):
-            match = re.search(r'<\|(\d+)\|>', line)
+            match = re.search(pattern, line)
             if match:
                 has_numeric_prefix = True
-                current_index = int(match.group(1))
+                current_index = int(match.group(1) or match.group(2))
                 if current_index == 1:  # 查找最小标号 <|1|> / find <|1|>
                     min_index_line_index = index
-                if max_index_line_index == -1 or current_index > int(re.search(r'<\|(\d+)\|>', lines[max_index_line_index]).group(1)):  # 查找最大标号 / find max number
+                if max_index_line_index == -1 or current_index > int(re.search(r'(?:<\|(\d+)\|>|^\s*(\d+)[\.\:\)\-\s])', lines[max_index_line_index]).group(1)):  # 查找最大标号 / find max number
                     max_index_line_index = index
+                else:
+                    prev_match = re.search(pattern, lines[max_index_line_index])
+                    prev_index = int(prev_match.group(1) or prev_match.group(2))
+
+                    if current_index > prev_index:
+                        max_index_line_index = index
                     
         if has_numeric_prefix:
             modified_lines = []
@@ -1276,3 +1299,4 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 relevant_terms[term] = translation
 
         return relevant_terms 
+
