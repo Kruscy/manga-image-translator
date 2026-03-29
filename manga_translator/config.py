@@ -153,6 +153,8 @@ class Upscaler(str, Enum):
 
 class RenderConfig(BaseModel):
     renderer: Renderer = Renderer.default
+    font_path: Optional[str] = None
+    """Path to a .ttf/.otf font file to use for rendering. Overrides the built-in default fonts."""
     """Render english text translated from manga with some additional typesetting. Ignores some other argument options"""
     alignment: Alignment = Alignment.auto
     """Align rendered text"""
@@ -287,6 +289,10 @@ class DetectorConfig(BaseModel):
     """Threshold for bbox generation"""
     unclip_ratio: float = 2.3
     """How much to extend text skeleton to form bounding box"""
+    use_bubble_prefilter: bool = False
+    """Run the ogkalu/comic-text-and-bubble-detector HuggingFace model before the main text detector to restrict detection to speech bubble and free-text regions. Requires transformers>=4.49.0."""
+    bubble_prefilter_confidence: float = 0.3
+    """Confidence threshold for the bubble pre-filter detector (0.0–1.0). Lower values keep more regions."""
 
 class InpainterConfig(BaseModel):
     inpainter: Inpainter = Inpainter.lama_large
@@ -309,6 +315,8 @@ class OcrConfig(BaseModel):
     """Use bbox merge when Manga OCR inference."""
     ocr: Ocr = Ocr.ocr48px
     """Optical character recognition (OCR) model to use"""
+    secondary_ocr: Optional[Ocr] = None
+    """Optional second OCR model to run in parallel. Results are compared per region and the better one is kept. Useful for italic/unusual fonts where one model may only capture part of the text."""
     min_text_length: int = 0
     """Minimum text length of a text region"""
     ignore_bubble: int = 0

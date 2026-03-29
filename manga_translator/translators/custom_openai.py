@@ -228,7 +228,7 @@ class CustomOpenAiTranslator(ConfigGPT, CommonTranslator):
         response = await self.client.chat.completions.create(
             model=self.model or CUSTOM_OPENAI_MODEL,
             messages=messages,
-            max_tokens=self._MAX_TOKENS // 2,
+            max_completion_tokens=1024,
             temperature=self.temperature,
             top_p=self.top_p,
         )

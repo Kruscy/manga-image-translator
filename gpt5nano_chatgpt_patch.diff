@@ -1,0 +1,34 @@
+
+--- a/manga_translator/translators/chatgpt.py
++++ b/manga_translator/translators/chatgpt.py
+@@
+-        response = await self.client.chat.completions.create(
+-            model=self.model,
+-            messages=messages,
+-            temperature=self.temperature,
+-            max_tokens=self.max_tokens
+-        )
+-
+-        text = response.choices[0].message.content
++        # GPT‑5 / GPT‑5‑nano compatible request
++        response = await self.client.chat.completions.create(
++            model=self.model,
++            messages=messages,
++            max_completion_tokens=self.max_tokens
++        )
++
++        text = None
++
++        # Standard Chat Completions response
++        try:
++            text = response.choices[0].message.content
++        except Exception:
++            pass
++
++        # GPT‑5 fallback format
++        if not text and hasattr(response, "output_text"):
++            text = response.output_text
++
++        # Final fallback
++        if not text:
++            text = str(response)

@@ -260,7 +260,8 @@ class MangaTranslatorLocal(MangaTranslator):
                 logger.warn(f'Failed to open image: {path}')
                 return False
 
-            # 直接翻译图片，不再需要传递文件名
+            # Store filename so debug helpers (e.g. _save_ocr_region_debug) can use it
+            self._current_input_filename = os.path.basename(path)
             ctx = await self.translate(img, config)
             result = ctx.result
 

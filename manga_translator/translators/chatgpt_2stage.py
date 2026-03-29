@@ -405,7 +405,7 @@ class ChatGPT2StageTranslator(OpenAITranslator):
                         ],
                         temperature=self.refine_temperature,
                         max_completion_tokens=self.max_tokens,
-                        response_format=self.REFINE_RESPONSE_SCHEMA,
+                        response_format=self.REFINE_RESPONSE_SCHEMA
                     )
                     
                     if response and response.choices and response.choices[0].message.content:
@@ -927,7 +927,7 @@ class ChatGPT2StageTranslator(OpenAITranslator):
             model=model_to_use,
             messages=messages,
             max_tokens=self._MAX_TOKENS // 2,
-            temperature=self.temperature,
+            temperature=1,
             top_p=self.top_p,
             timeout=self._TIMEOUT
         )

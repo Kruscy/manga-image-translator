@@ -1,0 +1,39 @@
+{
+  "detector": {
+    "name": "ctd",
+    "box_threshold": 0.3,
+    "max_candidates": 70
+  },
+  "ocr": {
+    "orc": "surya",
+    "use_mocr_merge": true,
+    "ignore_bubble": 0
+  },
+  "render": {
+    "renderer": "manga2eng",
+    "alignment": "auto",
+    "uppercase": false,
+    "lowercase": false,
+    "no_hyphenation": true,
+    "gimp_font": "CCWildWordsLower-Regular",
+    "auto_font_size": true,
+    "font_size_offset": -2,
+    "min_font_size": 12,
+    "max_font_size": 28,
+    "max_text_width_ratio": 0.80
+  },
+  "inpainter": {
+    "name": "lama",
+    "inpainting_size": 1024
+  },
+  "translator": {
+    "translator": "openai",
+    "model": "gpt-4.1-mini",
+    "source_lang": "JPN",
+    "target_lang": "HUN"
+  }
+  {
+  "models_dir": "C:/Manga/manga-image-translator/models",
+  "font_path": "C:/Manga/manga-image-translator/fonts"
+  }
+}

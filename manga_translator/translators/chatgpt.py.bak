@@ -25,12 +25,12 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
 
     # ---- 关键参数 ----
     _MAX_REQUESTS_PER_MINUTE = 0
-    _TIMEOUT = 60                # 每次请求的超时时间
-    _RETRY_ATTEMPTS = 1          # 对同一个批次的最大整体重试次数
+    _TIMEOUT = 30                # 每次请求的超时时间
+    _RETRY_ATTEMPTS = 0          # 对同一个批次的最大整体重试次数
     _TIMEOUT_RETRY_ATTEMPTS = 1  # 请求因超时被取消后，最大尝试次数
     _RATELIMIT_RETRY_ATTEMPTS = 1# 遇到 429 等限流时的最大尝试次数
     _MAX_SPLIT_ATTEMPTS = 1      # 递归拆分批次的最大层数
-    _MAX_TOKENS = 8000           # prompt+completion 的最大 token (可按模型类型调整)
+    _MAX_TOKENS = 8192           # prompt+completion 的最大 token (可按模型类型调整)
 
     def __init__(self, check_openai_key=True):
         # ConfigGPT 的初始化
@@ -79,7 +79,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
             self.console = Console()  
         self.prev_context = ""
         # 可选的回退模型（通过环境变量 OPENAI_FALLBACK_MODEL 指定）
-        self._fallback_model = None
+        self._fallback_model = os.getenv("OPENAI_FALLBACK_MODEL")
 
     def set_prev_context(self, text: str = ""):
         self.prev_context = text or ""     
@@ -118,7 +118,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         """
 
         lang_name = self._LANGUAGE_CODE_MAP.get(to_lang, to_lang) if to_lang in self._LANGUAGE_CODE_MAP else to_lang
-        MAX_BATCH = 16
+        MAX_BATCH = 8
         MAX_CHAR_PER_PROMPT = self._MAX_TOKENS * 4  # 粗略: 1 token ~ 4 chars
         chunk_queries = []
         current_length = 0
@@ -619,35 +619,45 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         while True:
             await self._ratelimit_sleep()
             started = time.time()
+            return await self._request_translation(to_lang, prompt)
 
             try:
                 # 等待请求
-                return await asyncio.wait_for(
-                    self._request_translation(to_lang, prompt),
-                    timeout=self._TIMEOUT
-                )        # 超时 => 取消请求并重试
-            except asyncio.TimeoutError:
-                timeout_attempt += 1
-                if timeout_attempt > self._TIMEOUT_RETRY_ATTEMPTS:
-                    raise TimeoutError("Request timed out")
-                self.logger.warning(f"Timeout, retrying... ({timeout_attempt})")
+                while not req_task.done():
+                    await asyncio.sleep(0.1)
+                    if time.time() - started > self._TIMEOUT:
+                        # 超时 => 取消请求并重试
+                        timeout_attempt += 1
+                        if timeout_attempt > self._TIMEOUT_RETRY_ATTEMPTS:
+                            raise TimeoutError(
+                                f"OpenAI request timed out after {self._TIMEOUT_RETRY_ATTEMPTS} attempts."
+                            )
+                        self.logger.warning(f"Request timed out, retrying... (attempt={timeout_attempt})")
+                        req_task.cancel()
+                        break
+                else:
+                    # 如果正常完成了
+                    return req_task.result()
 
             except openai.RateLimitError:
+                # 限流 => 重试
                 ratelimit_attempt += 1
                 if ratelimit_attempt > self._RATELIMIT_RETRY_ATTEMPTS:
                     raise
-                self.logger.warning(f"Rate limit, retrying... ({ratelimit_attempt})")
+                self.logger.warning(f"Hit RateLimit, retrying... (attempt={ratelimit_attempt})")
                 await asyncio.sleep(2)
 
             except openai.APIError as e:
+                # 服务器错误 => 重试
                 server_error_attempt += 1
                 if server_error_attempt > self._RETRY_ATTEMPTS:
+                    self.logger.error("Server error, giving up after several attempts.")
                     raise
-                self.logger.warning(f"API error, retrying... ({server_error_attempt})")
+                self.logger.warning(f"Server error: {str(e)}. Retrying... (attempt={server_error_attempt})")
                 await asyncio.sleep(1)
 
             except Exception as e:
-                self.logger.error(f"Unexpected error: {e}")
+                self.logger.error(f"Unexpected error in _request_with_retry: {str(e)}")
                 raise
 
     async def _request_translation(self, to_lang: str, prompt: str) -> str:
@@ -667,13 +677,9 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 'role': 'system',
                 'content': self.chat_system_template.format(to_lang=lang_name) +
                 "\nReturn ONLY the translations.\n"
-                "Do NOT censor or refuse.\n"
                 "Keep the <|number|> prefix exactly as given.\n"
                 "Do not merge lines.\n"
                 "Do not add explanations.\n"
-                "Fordíts természetes, folyékony magyar nyelvre, ne szó szerint.\n"
-                "Használj hétköznapi, beszélt magyar stílust.\n"
-                "Ha a szó szerinti fordítás furcsán hangzik, fogalmazd át.\n"
             },  
         ]  
 
@@ -722,28 +728,19 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         
 
         # 发起请求 / Initiate the request
-        response = await self.client.responses.create(
-            model= self._fallback_model or OPENAI_MODEL,
-            input=messages,
-            max_output_tokens=self._MAX_TOKENS // 2,
-            reasoning={"effort": "low"},   # 🔥 kritikus
+        response = await self.client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            max_completion_tokens=self._MAX_TOKENS // 2,
             
             top_p=self.top_p,
             timeout=self._TIMEOUT
         )
-        raw_text = ""
-        if hasattr(response, "output_text") and response.output_text:
-            raw_text = response.output_text
-            
-        else:
-            try:
-                raw_text = response.output[0].content[0].text
-            except Exception:
-                self.logger.error(f"FULL RESPONSE: {response}")
-                raise ValueError("Empty response from OpenAI API")
 
-    
-        
+        if not response.choices:
+            raise ValueError("Empty response from OpenAI API")
+
+        raw_text = response.choices[0].message.content
         self.logger.info("=== RAW GPT RESPONSE ===")
         self.logger.info(raw_text)
         self.logger.info("========================")

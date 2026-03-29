@@ -10,6 +10,7 @@ import logging
 import sys
 import traceback
 import numpy as np
+import time
 from PIL import Image
 from typing import Optional, Any, List
 import py3langid as langid
@@ -20,6 +21,7 @@ from .utils import (
     LANGUAGE_ORIENTATION_PRESETS,
     ModelWrapper,
     Context,
+    Quadrilateral,
     load_image,
     dump_image,
     visualize_textblocks,
@@ -28,6 +30,7 @@ from .utils import (
 )
 
 from .detection import dispatch as dispatch_detection, prepare as prepare_detection, unload as unload_detection
+from .detection.comic_bubble_hf import get_bubble_detector
 from .upscaling import dispatch as dispatch_upscaling, prepare as prepare_upscaling, unload as unload_upscaling
 from .ocr import dispatch as dispatch_ocr, prepare as prepare_ocr, unload as unload_ocr
 from .textline_merge import dispatch as dispatch_textline_merge
@@ -48,7 +51,7 @@ logger = logging.getLogger('manga_translator')
 # 全局console实例，用于日志重定向
 _global_console = None
 _log_console = None
-
+t0 = time.time()
 def set_main_logger(l):
     global logger
     logger = l
@@ -147,6 +150,7 @@ class MangaTranslator:
         # 调试图片管理相关属性
         self._current_image_context = None  # 存储当前处理图片的上下文信息
         self._saved_image_contexts = {}     # 存储批量处理中每个图片的上下文信息
+        self._current_input_filename = 'unknown'  # Set by local.py before each translate() call
         
         # 设置日志文件
         self._setup_log_file()
@@ -464,15 +468,18 @@ class MangaTranslator:
 
         ctx.img_rgb, ctx.img_alpha = load_image(ctx.upscaled)
 
-        # -- Detection
+        # -- Detection (+ optional bubble detector fallback for missed regions)
         await self._report_progress('detection')
         try:
-            ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(config, ctx)
-        except Exception as e:  
-            logger.error(f"Error during detection:\n{traceback.format_exc()}")  
-            if not self.ignore_errors:  
-                raise 
-            ctx.textlines = [] 
+            if config.detector.use_bubble_prefilter:
+                ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection_with_bubble_fallback(config, ctx)
+            else:
+                ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(config, ctx)
+        except Exception as e:
+            logger.error(f"Error during detection:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.textlines = []
             ctx.mask_raw = None
             ctx.mask = None
 
@@ -506,8 +513,10 @@ class MangaTranslator:
             # If no text was found result is intermediate image product
             ctx.result = ctx.upscaled
             return await self._revert_upscale(config, ctx)
-
+        logger.info(f"OCR time: {time.time()-t0:.2f}s")
+        
         # -- Textline merge
+        t = time.time()
         await self._report_progress('textline_merge')
         try:
             ctx.text_regions = await self._run_textline_merge(config, ctx)
@@ -522,7 +531,8 @@ class MangaTranslator:
             bboxes = visualize_textblocks(cv2.cvtColor(ctx.img_rgb, cv2.COLOR_BGR2RGB), ctx.text_regions, 
                                         show_panels=show_panels, img_rgb=ctx.img_rgb, right_to_left=config.render.rtl)
             cv2.imwrite(self._result_path('bboxes.png'), bboxes)
-
+        logger.info(f"Merge request time: {time.time()-t0:.2f}s")
+        
         # Apply pre-dictionary after textline merge
         pre_dict = load_dictionary(self.pre_dict)
         pre_replacements = []
@@ -539,6 +549,8 @@ class MangaTranslator:
         else:
             logger.info("No pre-translation replacements made.")
             
+        logger.info(f"pre-directionary request time: {time.time()-t0:.2f}s")
+        
         # -- Translation
         await self._report_progress('translating')
         try:
@@ -559,6 +571,7 @@ class MangaTranslator:
             await self._report_progress('cancelled', True)
             ctx.result = ctx.upscaled
             return await self._revert_upscale(config, ctx)
+        logger.info(f"fordítás request time: {time.time()-t0:.2f}s")
 
         # -- Mask refinement
         # (Delayed to take advantage of the region filtering done after ocr and translation)
@@ -577,6 +590,8 @@ class MangaTranslator:
                                                           self.device, self.verbose)
             cv2.imwrite(self._result_path('inpaint_input.png'), cv2.cvtColor(inpaint_input_img, cv2.COLOR_RGB2BGR))
             cv2.imwrite(self._result_path('mask_final.png'), ctx.mask)
+        logger.info(f"maszkolás request time: {time.time()-t0:.2f}s")
+        
 
         # -- Inpainting
         await self._report_progress('inpainting')
@@ -599,6 +614,8 @@ class MangaTranslator:
             except Exception as e:
                 logger.error(f"Error saving inpainted.png debug image: {e}")
                 logger.debug(f"Exception details: {traceback.format_exc()}")
+        logger.info(f"inpainting request time: {time.time()-t0:.2f}s")
+        
         # -- Rendering
         await self._report_progress('rendering')
 
@@ -620,7 +637,8 @@ class MangaTranslator:
         ctx.result = dump_image(ctx.input, ctx.img_rendered, ctx.img_alpha)
 
         return await self._revert_upscale(config, ctx)
-    
+        logger.info(f"render request time: {time.time()-t0:.2f}s")
+        
     # If `revert_upscaling` is True, revert to input size
     # Else leave `ctx` as-is
     async def _revert_upscale(self, config: Config, ctx: Context):
@@ -682,6 +700,36 @@ class MangaTranslator:
         self._model_usage_timestamps[("upscaling", config.upscale.upscaler)] = current_time
         return (await dispatch_upscaling(config.upscale.upscaler, [ctx.img_colorized], config.upscale.upscale_ratio, self.device))[0]
 
+    async def _run_bubble_prefilter(self, config: Config, ctx: Context) -> np.ndarray:
+        """
+        Runs the ogkalu/comic-text-and-bubble-detector RT-DETR-v2 model on ctx.img_rgb and
+        returns a masked copy of the image where regions outside detected bubbles/text areas
+        are filled with white (255). This restricts the subsequent text detector to regions
+        that are likely to contain text.
+        """
+        detector = get_bubble_detector()
+        await detector.load(self.device)
+
+        regions = detector.detect_regions(ctx.img_rgb, config.detector.bubble_prefilter_confidence)
+
+        if not regions:
+            logger.debug('Bubble pre-filter: no regions detected, passing image unchanged')
+            return ctx.img_rgb
+
+        h, w = ctx.img_rgb.shape[:2]
+        masked = np.full_like(ctx.img_rgb, 255)
+        for box, _label in regions:
+            x1, y1, x2, y2 = map(int, box)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            masked[y1:y2, x1:x2] = ctx.img_rgb[y1:y2, x1:x2]
+
+        if self.verbose:
+            import cv2 as _cv2
+            _cv2.imwrite(self._result_path('bubble_prefilter.png'), _cv2.cvtColor(masked, _cv2.COLOR_RGB2BGR))
+
+        return masked
+
     async def _run_detection(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("detection", config.detector.detector)] = current_time
@@ -689,8 +737,94 @@ class MangaTranslator:
                                         config.detector.box_threshold,
                                         config.detector.unclip_ratio, config.detector.det_invert, config.detector.det_gamma_correct, config.detector.det_rotate,
                                         config.detector.det_auto_rotate,
-                                        self.device, self.verbose)        
+                                        self.device, self.verbose)
         return result
+
+    async def _run_detection_with_bubble_fallback(self, config: Config, ctx: Context):
+        """
+        1. Bubble detector fut először → megtalálja a buborék régiókat.
+        2. CTD fut a teljes képen → finomabb szövegsor dobozokat ad.
+           - Ha egy CTD doboz középpontja egy bubble régión belül van → megtartjuk
+             (CTD megtalálta a szövegsort a buborékban).
+           - Ha egy bubble régióban CTD egyáltalán nem talált semmit →
+             CTD-t futtatunk a kivágott területen (kisebb kép, jobb érzékenység).
+             Ha ott sem talál semmit → a teljes bubble régiót adjuk hozzá fallbackként.
+        3. CTD a bubble-on kívüli területekről minden eredményt megtart.
+        Nincs duplikáció: minden terület legfeljebb egyszer kerül OCR-re.
+        """
+        h, w = ctx.img_rgb.shape[:2]
+
+        # Step 1 – bubble detector
+        detector = get_bubble_detector()
+        await detector.load(self.device)
+        bubble_regions = detector.detect_regions(ctx.img_rgb, config.detector.bubble_prefilter_confidence)
+
+        bubble_boxes = []  # (bx1, by1, bx2, by2, label)
+        for box, label in bubble_regions:
+            if label == 0:
+                continue
+            bx1, by1, bx2, by2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+            bx1, by1 = max(0, bx1), max(0, by1)
+            bx2, by2 = min(w, bx2), min(h, by2)
+            if bx2 > bx1 and by2 > by1:
+                bubble_boxes.append((bx1, by1, bx2, by2, label))
+
+        logger.info(f'[Detection] Bubble detector: {len(bubble_boxes)} régió')
+
+        # Step 2 – CTD a teljes képen
+        ctd_textlines, raw_mask, mask = await self._run_detection(config, ctx)
+        logger.info(f'[Detection] CTD (teljes kép): {len(ctd_textlines)} régió')
+
+        # Rendeljük hozzá a CTD dobozokat a bubble régiókhoz
+        bubble_ctd_map = {i: [] for i in range(len(bubble_boxes))}
+        outside_ctd = []
+        for tl in ctd_textlines:
+            cx = (tl.xyxy[0] + tl.xyxy[2]) / 2
+            cy = (tl.xyxy[1] + tl.xyxy[3]) / 2
+            matched = False
+            for i, (bx1, by1, bx2, by2, _lbl) in enumerate(bubble_boxes):
+                if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                    bubble_ctd_map[i].append(tl)
+                    matched = True
+                    break
+            if not matched:
+                outside_ctd.append(tl)
+
+        # Step 3 – bubble régiónként: ha CTD talált benne valamit → használjuk azt;
+        #          ha nem → CTD a kivágott területen, majd fallback
+        textlines = list(outside_ctd)
+        for i, (bx1, by1, bx2, by2, b_label) in enumerate(bubble_boxes):
+            label_name = {1: 'text_bubble', 2: 'text_free'}.get(b_label, 'unknown')
+            if bubble_ctd_map[i]:
+                textlines.extend(bubble_ctd_map[i])
+                logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort talált')
+            else:
+                # CTD nem talált semmit a buborékban → próbáljuk a kivágaton
+                crop = ctx.img_rgb[by1:by2, bx1:bx2]
+                crop_tls, _, _ = await dispatch_detection(
+                    config.detector.detector, crop,
+                    config.detector.detection_size, config.detector.text_threshold,
+                    config.detector.box_threshold, config.detector.unclip_ratio,
+                    config.detector.det_invert, config.detector.det_gamma_correct,
+                    config.detector.det_rotate, config.detector.det_auto_rotate,
+                    self.device, False
+                )
+                if crop_tls:
+                    for tl in crop_tls:
+                        # koordinátákat visszatranszformáljuk az eredeti képre
+                        offset_pts = tl.pts.copy().astype(np.int32)
+                        offset_pts[:, 0] += bx1
+                        offset_pts[:, 1] += by1
+                        textlines.append(Quadrilateral(offset_pts, '', tl.prob))
+                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: crop CTD {len(crop_tls)} sort talált')
+                else:
+                    # Fallback: a teljes bubble régiót adjuk hozzá
+                    pts = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]], dtype=np.int32)
+                    textlines.append(Quadrilateral(pts, '', 0.9))
+                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: fallback, teljes régió hozzáadva')
+
+        logger.info(f'[Detection] Végeredmény: {len(textlines)} régió')
+        return textlines, raw_mask, mask
 
     async def _unload_model(self, tool: str, model: str):
         logger.info(f"Unloading {tool} model: {model}")
@@ -748,6 +882,10 @@ class MangaTranslator:
         if ocr_result_dir:
             os.environ['MANGA_OCR_RESULT_DIR'] = ocr_result_dir
         
+        # Save region debug images when secondary OCR is configured
+        if config.ocr.secondary_ocr and config.ocr.secondary_ocr != config.ocr.ocr:
+            self._save_ocr_region_debug(ctx.img_rgb, ctx.textlines)
+
         try:
             textlines = await dispatch_ocr(config.ocr.ocr, ctx.img_rgb, ctx.textlines, config.ocr, self.device, self.verbose)
         finally:
@@ -756,6 +894,10 @@ class MangaTranslator:
                 os.environ['MANGA_OCR_RESULT_DIR'] = old_ocr_dir
             elif 'MANGA_OCR_RESULT_DIR' in os.environ:
                 del os.environ['MANGA_OCR_RESULT_DIR']
+
+        # -- Secondary OCR comparison (optional)
+        if config.ocr.secondary_ocr and config.ocr.secondary_ocr != config.ocr.ocr:
+            textlines = await self._run_secondary_ocr_and_merge(config, ctx, textlines)
 
         new_textlines = []
         for textline in textlines:
@@ -766,6 +908,89 @@ class MangaTranslator:
                     textline.bg_r, textline.bg_g, textline.bg_b = config.render.font_color_bg
                 new_textlines.append(textline)
         return new_textlines
+
+    def _save_ocr_region_debug(self, img_rgb: np.ndarray, textlines, label: str = ''):
+        """
+        Save a full-image overview with numbered green bounding boxes to C:/Manga/result/.
+        Filename matches the input image so it's easy to correlate.
+        Always saved (not verbose-only) when secondary_ocr is configured.
+        """
+        out_dir = r'C:/Manga/result'
+        os.makedirs(out_dir, exist_ok=True)
+
+        overview = img_rgb.copy()
+        for i, tl in enumerate(textlines):
+            cv2.polylines(overview, [tl.pts], True, (0, 200, 0), 2)
+            cx = int(tl.pts[:, 0].mean())
+            cy = int(tl.pts[:, 1].mean())
+            cv2.putText(overview, str(i + 1), (cx - 6, cy + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 50, 255), 2, cv2.LINE_AA)
+        overview_bgr = cv2.cvtColor(overview, cv2.COLOR_RGB2BGR)
+
+        base, ext = os.path.splitext(self._current_input_filename)
+        suffix = f'_{label}' if label else ''
+        out_path = os.path.join(out_dir, f'{base}_ocr_debug{suffix}{ext or ".png"}')
+        cv2.imwrite(out_path, overview_bgr)
+        logger.info(f'[OCR debug] {len(textlines)} régiót jelöltem → {out_path}')
+
+    def _ocr_score(self, text: str, prob: float = 1.0) -> float:
+        """Score an OCR result: longer, cleaner text with higher confidence wins."""
+        if not text or not text.strip():
+            return 0.0
+        stripped = text.strip()
+        printable_ratio = sum(1 for c in stripped if c.isprintable() and not c.isspace()) / max(len(stripped), 1)
+        return len(stripped) * printable_ratio * (0.5 + 0.5 * prob)
+
+    async def _run_secondary_ocr_and_merge(self, config, ctx, primary_textlines):
+        """
+        Run a second OCR model on the same regions, compare results per region,
+        and return the better text for each. Logs a comparison table.
+        """
+        # Save primary results keyed by object identity
+        primary_save = {id(tl): (tl.text, tl.prob) for tl in ctx.textlines}
+
+        # Reset text/prob so secondary OCR starts fresh on all regions
+        for tl in ctx.textlines:
+            tl.text = ''
+            tl.prob = 0.0
+
+        secondary_textlines = await dispatch_ocr(
+            config.ocr.secondary_ocr, ctx.img_rgb, ctx.textlines,
+            config.ocr, self.device, self.verbose
+        )
+
+        secondary_save = {id(tl): (tl.text, tl.prob) for tl in ctx.textlines}
+
+        # Merge: restore primary results and compare
+        any_diff = False
+        for tl in ctx.textlines:
+            p_text, p_prob = primary_save.get(id(tl), ('', 0.0))
+            s_text, s_prob = secondary_save.get(id(tl), ('', 0.0))
+
+            p_score = self._ocr_score(p_text, p_prob)
+            s_score = self._ocr_score(s_text, s_prob)
+
+            if p_text != s_text:
+                any_diff = True
+                winner = 'primary' if p_score >= s_score else 'secondary'
+                logger.info(
+                    f'[OCR] primary({config.ocr.ocr})={repr(p_text)} score={p_score:.1f} | '
+                    f'secondary({config.ocr.secondary_ocr})={repr(s_text)} score={s_score:.1f} '
+                    f'→ {winner}'
+                )
+
+            if p_score >= s_score:
+                tl.text = p_text
+                tl.prob = p_prob
+            else:
+                tl.text = s_text
+                tl.prob = s_prob
+
+        if not any_diff:
+            logger.info('[OCR] Both OCR models produced identical results for all regions.')
+
+        # Return union: textlines that have text from either model
+        return [tl for tl in ctx.textlines if tl.text.strip()]
 
     async def _run_textline_merge(self, config: Config, ctx: Context):
         current_time = time.time()
@@ -1368,12 +1593,14 @@ class MangaTranslator:
             output = ctx.img_inpainted
         # manga2eng currently only supports horizontal left to right rendering
         elif (config.render.renderer == Renderer.manga2Eng or config.render.renderer == Renderer.manga2EngPillow) and ctx.text_regions and LANGUAGE_ORIENTATION_PRESETS.get(ctx.text_regions[0].target_lang) == 'h':
+            _font = config.render.font_path or self.font_path
             if config.render.renderer == Renderer.manga2EngPillow:
-                output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
+                output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing)
             else:
-                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, self.font_path, config.render.line_spacing)
+                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing)
         else:
-            output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, self.font_path, config.render.font_size,
+            _font = config.render.font_path or self.font_path
+            output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, _font, config.render.font_size,
                                               config.render.font_size_offset,
                                               config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing)
         return output
@@ -1722,15 +1949,18 @@ class MangaTranslator:
 
         ctx.img_rgb, ctx.img_alpha = load_image(ctx.upscaled)
 
-        # -- Detection
+        # -- Detection (+ optional bubble detector fallback for missed regions)
         await self._report_progress('detection')
         try:
-            ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(config, ctx)
-        except Exception as e:  
-            logger.error(f"Error during detection:\n{traceback.format_exc()}")  
-            if not self.ignore_errors:  
-                raise 
-            ctx.textlines = [] 
+            if config.detector.use_bubble_prefilter:
+                ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection_with_bubble_fallback(config, ctx)
+            else:
+                ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(config, ctx)
+        except Exception as e:
+            logger.error(f"Error during detection:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.textlines = []
             ctx.mask_raw = None
             ctx.mask = None
 

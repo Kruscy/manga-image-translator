@@ -92,10 +92,24 @@ class ConfigGPT:
                 '<|3|>なんだこいつ 空気読めて ないのか…？'
             ),
             (
-                
+
                 "<|1|>부끄러워... 눈에 띄고 싶지 않아... 나 숨고 싶어...\n"
                 "<|2|>너 괜찮아?\n"
                 "<|3|>이 녀석, 뭐야? 분위기 못 읽는 거야...?\n"
+            )
+        ],
+        'Hungarian': [
+            (
+                "<|1|>I'm embarrassed... I don't want to stand out... I want to disappear...\n"
+                "<|2|>Are you okay?!\n"
+                "<|3|>What's wrong with this guy? Can't he read the situation...?\n"
+                "<|4|>HEHEHE... What you said, comrade, is getting us all excited."
+            ),
+            (
+                "<|1|>Szégyellem magam... Nem akarok feltűnni... El akarok tűnni...\n"
+                "<|2|>Jól vagy?!\n"
+                "<|3|>Mi a baj ezzel a fickóval? Nem érzi a hangulatot...?\n"
+                "<|4|>HEHEHE... Amit mondtál, elvtárs, az mindenkit felizgat."
             )
         ]
     }
