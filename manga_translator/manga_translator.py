@@ -437,6 +437,11 @@ class MangaTranslator:
         # Start the background cleanup job once if not already started.
         if self._detector_cleanup_task is None:
             self._detector_cleanup_task = asyncio.create_task(self._detector_cleanup_job())
+
+        # -- Torii full-image translation shortcircuit
+        if config.translator.translator == Translator.torii:
+            return await self._translate_with_torii(config, ctx)
+
         # -- Colorization
         if config.colorizer.colorizer != Colorizer.none:
             await self._report_progress('colorizing')
@@ -680,6 +685,37 @@ class MangaTranslator:
             ctx.use_placeholder = True
             return ctx
 
+        return ctx
+
+    async def _translate_with_torii(self, config: Config, ctx: Context) -> Context:
+        """
+        Full-image translation using ToriiTranslate's /api/v2/upload endpoint.
+        Bypasses detection, OCR, text translation, inpainting and rendering.
+        The translated image is returned directly as ctx.result.
+        """
+        from .translators.torii_image import translate_image_with_torii
+
+        await self._report_progress('translating')
+        logger.info('Using ToriiTranslate full-image translation pipeline...')
+        t = config.translator
+        try:
+            result = await translate_image_with_torii(
+                image=ctx.input,
+                target_lang=t.target_lang,
+                torii_model=t.torii_model,
+                torii_font=t.torii_font,
+                torii_text_align=t.torii_text_align,
+                torii_stroke_disabled=t.torii_stroke_disabled,
+                torii_min_font_size=t.torii_min_font_size,
+            )
+            ctx.result = result
+            logger.info('ToriiTranslate translation complete.')
+        except Exception as e:
+            logger.error(f'ToriiTranslate failed: {e}')
+            if not self.ignore_errors:
+                raise
+            ctx.result = ctx.input  # return original on failure
+        await self._report_progress('finished', True)
         return ctx
 
     async def _run_colorizer(self, config: Config, ctx: Context):

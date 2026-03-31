@@ -136,6 +136,7 @@ class Translator(str, Enum):
     mbart50 = "mbart50"
     qwen2 = "qwen2"
     qwen2_big = "qwen2_big"
+    torii = "torii"
 
     def __str__(self):
         return self.name
@@ -234,6 +235,18 @@ class TranslatorConfig(BaseModel):
     selective_translation: Optional[str] = None
     """Select a translator based on detected language in image. Note the first translation service acts as default if the language isn\'t defined. Example: --translator-chain "google:JPN;sugoi:ENG".'"""
     
+    # ToriiTranslate full-image translation settings (used when translator = "torii")
+    torii_model: str = "gemini-3-flash"
+    """AI model to use for Torii translation (gemini-3-flash, deepseek, grok, kimi, gpt-5.1, gemini-2.5-flash-lite)"""
+    torii_font: str = "wildwords"
+    """Font for Torii rendering (wildwords, anime-ace, etc.)"""
+    torii_text_align: str = "auto"
+    """Text alignment for Torii (auto, left, center, right)"""
+    torii_stroke_disabled: bool = False
+    """Disable text stroke in Torii rendering"""
+    torii_min_font_size: int = 12
+    """Minimum font size for Torii rendering"""
+
     # 译后检查配置项
     enable_post_translation_check: bool = True
     """Enable post-translation validation check"""

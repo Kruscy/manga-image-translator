@@ -1,5 +1,5 @@
 {
-  "_comment_mode": "Torii FULL pipeline: az egész képet elküldi a Torii API-nak (OCR + fordítás + inpainting + renderelés mind Torii csinálja). Ha csak bizonyos részekhez akarod a Torii-t, lásd torii_mixed.json",
+  "_comment_mode": "Torii MIXED: Torii OCR + Torii inpainting, de a fordítás OpenAI/GPT-vel megy. Pontosabb szövegfelismerés és szöveg-eltávolítás, de a fordítást te irányítod.",
   "detector": {
     "name": "ctd",
     "detection_size": 2048,
@@ -7,16 +7,16 @@
     "box_threshold": 0.75,
     "max_candidates": 70,
     "unclip_ratio": 2.3,
-    "use_bubble_prefilter": false,
+    "use_bubble_prefilter": true,
     "bubble_prefilter_confidence": 0.3
   },
   "ocr": {
-    "ocr": "48px_ctc",
+    "ocr": "torii",
     "use_mocr_merge": false,
     "ignore_bubble": 0
   },
   "inpainter": {
-    "name": "lama_large",
+    "name": "torii",
     "inpainting_size": 2048,
     "inpainting_precision": "bf16"
   },
@@ -36,13 +36,10 @@
     "upscaler": "esrgan"
   },
   "translator": {
-    "translator": "torii",
-    "target_lang": "HUN",
-    "torii_model": "gemini-3-flash",
-    "torii_font": "wildwords",
-    "torii_text_align": "auto",
-    "torii_stroke_disabled": false,
-    "torii_min_font_size": 12
+    "translator": "openai",
+    "model": "gpt-5-nano",
+    "source_lang": "auto",
+    "target_lang": "HUN"
   },
   "kernel_size": 3,
   "mask_dilation_offset": 30,
