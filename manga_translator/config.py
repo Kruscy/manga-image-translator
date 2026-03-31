@@ -96,6 +96,7 @@ class Inpainter(str, Enum):
     sd = "sd"
     none = "none"
     original = "original"
+    torii = "torii"
 
 class Colorizer(str, Enum):
     none = "none"
@@ -106,6 +107,7 @@ class Ocr(str, Enum):
     ocr48px = "48px"
     ocr48px_ctc = "48px_ctc"
     mocr = "mocr"
+    torii = "torii"
 
 class Translator(str, Enum):
     youdao = "youdao"

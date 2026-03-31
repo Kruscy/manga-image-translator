@@ -1,0 +1,51 @@
+====================================================
+  ToriiTranslate API - beállítási útmutató (.env)
+====================================================
+
+Nyisd meg a .env fájlt a manga-image-translator mappájában
+(ha nem létezik, hozd létre mellé).
+
+Add hozzá ezt a sort, és cseréld le az API kulcsodra:
+
+  TORII_API_KEY=ide_jön_az_api_kulcsod
+
+Például:
+  TORII_API_KEY=sk-torii-abc123xyz...
+
+
+----------------------------------------------------
+  Indítási parancs (torii.json config betöltéssel)
+----------------------------------------------------
+
+  python -m manga_translator local -i C:\Manga\input -o C:\Manga\output --config C:\Manga\manga-image-translator\config\torii.json --use-gpu
+
+
+----------------------------------------------------
+  Mire használja a Torii API-t ez a konfig?
+----------------------------------------------------
+
+  OCR:        Torii /api/ocr   – szövegfelismerés (1 kredit/kérés)
+  Inpainting: Torii /api/inpaint – szöveg eltávolítása (0.02 kredit/kérés)
+  Fordítás:   OpenAI (gpt-5-nano) – szöveg fordítása magyarra
+
+
+----------------------------------------------------
+  Testreszabási lehetőségek a torii.json-ban
+----------------------------------------------------
+
+  Ha másik OCR-t akarsz (pl. a beépített 48px helyett Torii):
+    "ocr": { "ocr": "torii" }        <- Torii OCR
+    "ocr": { "ocr": "48px_ctc" }     <- beépített OCR (gyorsabb, offline)
+    "ocr": { "ocr": "48px" }         <- másik beépített OCR
+
+  Ha másik inpainter-t akarsz:
+    "inpainter": { "name": "torii" }       <- Torii inpaint API
+    "inpainter": { "name": "lama_large" }  <- beépített lama (offline, gyors)
+
+  Ha másik fordítót akarsz:
+    "translator": { "translator": "openai",   "model": "gpt-5-nano"    }
+    "translator": { "translator": "deepseek", "model": "deepseek-chat" }
+    "translator": { "translator": "gemini",   "model": "gemini-1.5-flash-002" }
+
+
+====================================================

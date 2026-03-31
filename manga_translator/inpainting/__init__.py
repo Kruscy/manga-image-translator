@@ -8,6 +8,7 @@ from .inpainting_lama_mpe import LamaMPEInpainter, LamaLargeInpainter
 from .inpainting_sd import StableDiffusionInpainter
 from .none import NoneInpainter
 from .original import OriginalInpainter
+from .inpainting_torii import ToriiInpainter
 from ..config import Inpainter, InpainterConfig
 
 INPAINTERS = {
@@ -17,6 +18,7 @@ INPAINTERS = {
     Inpainter.sd: StableDiffusionInpainter,
     Inpainter.none: NoneInpainter,
     Inpainter.original: OriginalInpainter,
+    Inpainter.torii: ToriiInpainter,
 }
 inpainter_cache = {}
 
