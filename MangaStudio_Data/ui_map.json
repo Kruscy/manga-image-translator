@@ -109,6 +109,15 @@
     "default": "default",
     "tooltip": "The AI model used to find text bubbles on the page. 'default' is recommended for most comics."
   },
+  "secondary_detectors": {
+    "widget": "multi_segmented_button",
+    "group": "Detector & OCR",
+    "order": 225,
+    "label": "Extra Detectors:",
+    "default": [],
+    "values": ["default", "dbconvnext", "ctd", "craft", "paddle"],
+    "tooltip": "Additional text detectors to run after the primary detector. Results are merged (no duplicate boxes). Useful for manhwa/manhua where one detector misses text. Select multiple."
+  },
   "detection_size": {
     "widget": "slider",
     "group": "Detector & OCR",

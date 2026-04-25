@@ -327,6 +327,13 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 # Immediately clean leading and trailing whitespace from each translation text
                 new_translations = [t.strip() for t in new_translations]
 
+                # Ha a modell "FORRÁS -> FORDÍTÁS" formátumban válaszolt (pl. reasoning modelek),
+                # csak a ' -> ' utáni részt tartjuk meg.
+                new_translations = [
+                    t.rsplit(' -> ', 1)[-1].strip() if ' -> ' in t else t
+                    for t in new_translations
+                ]
+
                 if new_translations and not new_translations[0].strip():
                     new_translations = new_translations[1:]
                 
@@ -744,9 +751,9 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
 
     
         
-        self.logger.info("=== RAW GPT RESPONSE ===")
-        self.logger.info(raw_text)
-        self.logger.info("========================")
+        self.logger.debug("=== RAW GPT RESPONSE ===")
+        self.logger.debug(raw_text)
+        self.logger.debug("========================")
         # 去除 <think>...</think> 标签及内容。由于某些中转api的模型的思考过程是被强制输出的，并不包含在reasoning_content中，需要额外过滤
         # Remove <think>...</think> tags and their contents. Since the reasoning process of some relay API models is forcibly output and not included in the reasoning_content, additional filtering is required.
         raw_text = re.sub(r'(</think>)?<think>.*?</think>', '', raw_text, flags=re.DOTALL)

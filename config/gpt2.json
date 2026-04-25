@@ -21,7 +21,8 @@
     "uppercase": false,
     "lowercase": false,
     "no_hyphenation": true,
-    "gimp_font": "CCWildWordsLower-Regular",
+    "gimp_font": "WildWords",
+	"font_path": "./fonts/WildWords.ttf",
     "auto_font_size": true,
     "font_size_offset": -2,
     "min_font_size": 12,
@@ -44,6 +45,5 @@
   },
    "kernel_size": 3,
    "mask_dilation_offset": 30,
-   "models_dir": "C:/Manga/manga-image-translator/models",
-   "font_path": "C:/Manga/manga-image-translator/fonts/CCWildWordsLower-Regular.ttf"
+   "models_dir": "./models"
 }

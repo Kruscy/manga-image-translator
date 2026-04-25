@@ -254,7 +254,9 @@ async def dispatch(
     # TODO: Maybe remove intersections
 
     # Render text
-    for region, dst_points in tqdm(zip(text_regions, dst_points_list), '[render]', total=len(text_regions)):
+    for idx, (region, dst_points) in enumerate(tqdm(zip(text_regions, dst_points_list), '[render]', total=len(text_regions))):
+        translation = region.get_translation_for_rendering()
+        logger.info(f'[Render #{idx + 1}] OCR: {repr(region.text)} → Fordítás: {repr(translation)}')
         if render_mask is not None:
             # set render_mask to 1 for the region that is inside dst_points
             cv2.fillConvexPoly(render_mask, dst_points.astype(np.int32), 1)

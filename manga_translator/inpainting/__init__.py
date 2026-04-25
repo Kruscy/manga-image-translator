@@ -10,11 +10,13 @@ from .none import NoneInpainter
 from .original import OriginalInpainter
 from .inpainting_torii import ToriiInpainter
 from ..config import Inpainter, InpainterConfig
+from .inpainting_lama2 import LaMa2Inpainter
 
 INPAINTERS = {
     Inpainter.default: AotInpainter,
     Inpainter.lama_large: LamaLargeInpainter,
     Inpainter.lama_mpe: LamaMPEInpainter,
+    Inpainter.lama2: LaMa2Inpainter,
     Inpainter.sd: StableDiffusionInpainter,
     Inpainter.none: NoneInpainter,
     Inpainter.original: OriginalInpainter,

@@ -29,13 +29,14 @@
     "max_font_size": 28,
     "max_text_width_ratio": 0.80
   },
-  "upscale": {
-  "upscaler": "esrgan"
+    "upscale": {
+    "upscaler": "esrgan"
   },
   "inpainter": {
-  "inpainter": "lama_mpe",
-  "inpainting_size": 2048,
-  "inpainting_precision": "fp32"
+    "inpainter": "lama2",
+    "url": "http://192.168.0.90:8080/inpaint",
+    "ldmSteps": 30,
+    "hdStrategy": "Crop"
 },
   "translator": {
     "translator": "openai",

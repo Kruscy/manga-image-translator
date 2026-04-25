@@ -3,6 +3,10 @@ import json
 import subprocess
 import gc
 import shutil
+import re
+
+# Matches ANSI escape sequences (colors, cursor movement, etc.)
+_ANSI_ESCAPE = re.compile(r'\x1b(?:\[[0-9;]*[A-Za-z]|[()][0-9A-Za-z]|.)')
 
 try:
     import torch
@@ -131,21 +135,28 @@ class Pipeline:
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
                 env=my_env,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
-            for line in iter(self.process.stdout.readline, ''):
+            for raw_line in iter(self.process.stdout.readline, b''):
                 if self._stopped_by_user:
                     log_callback("WARNING", "User interrupt received, stopping process.")
                     break
 
+                line = raw_line.decode('utf-8', errors='replace')
+                # Handle \r\n (Windows line endings) first, then lone \r
+                # (used by progress bars/tqdm). A lone \r moves the cursor to
+                # the beginning of the line, so only the last segment matters.
+                line = line.replace('\r\n', '\n')
+                if '\r' in line:
+                    line = line.split('\r')[-1]
+                # Strip ANSI escape codes (colors, cursor movement) produced
+                # by Rich Console(force_terminal=True) or colorama.
+                line = _ANSI_ESCAPE.sub('', line)
+
                 stripped_line = line.strip()
                 if stripped_line:
                     log_callback("RAW", stripped_line)
-                    # --- NEW ERROR CHECKING ---
                     # Check for keywords that indicate a failure, even if the process exits cleanly.
                     if stripped_line.startswith("ERROR:") or "Traceback (most recent call last)" in stripped_line:
                         has_failed = True

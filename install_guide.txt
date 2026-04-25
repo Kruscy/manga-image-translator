@@ -1,0 +1,209 @@
+================================================================================
+  MANGA IMAGE TRANSLATOR - WINDOWS TELEPITESI UTMUTATO (Magyar)
+  Fork: https://github.com/Kruscy/manga-image-translator
+================================================================================
+
+--------------------------------------------------------------------------------
+1. SZUKSEGES PROGRAMOK TELEPITESE
+--------------------------------------------------------------------------------
+
+A kovetkezo programokat kell elore telepiteni, mielott elkezded:
+
+  [1.1] Python 3.10 vagy ujabb
+        Letoltes: https://www.python.org/downloads/
+        FONTOS: A telepito elso kepernyon jelold be az
+                "Add Python to PATH" jelolonegyzetet!
+                Enelkul a python parancs nem fog mukodni a parancssorban.
+        Ellenorzes: python --version
+
+  [1.2] Git
+        Letoltes: https://git-scm.com/download/win
+        Telepites kozben a default beallitasok megfeleloek.
+        Ellenorzes: git --version
+
+  [1.3] NVIDIA driver + CUDA Toolkit (csak ha van NVIDIA GPU-d)
+        Ha nincs NVIDIA GPU-d, ezt a lepest kihagyhatod - CPU-n is fut a program.
+        NVIDIA driver: https://www.nvidia.com/drivers
+        CUDA Toolkit:  https://developer.nvidia.com/cuda-downloads
+        Ajanlott CUDA verzio: 11.8 vagy 12.1
+        Ellenorzes: nvcc --version  es  nvidia-smi
+
+  [1.4] Visual C++ Build Tools
+        Bizonyos Python csomagok fordításahoz szükseges.
+        Letoltes: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+        A telepitesnel valaszd ki: "Desktop development with C++"
+
+
+--------------------------------------------------------------------------------
+2. A PROJEKT KLONOZASA
+--------------------------------------------------------------------------------
+
+Nyiss meg egy parancssort (cmd vagy PowerShell), majd navigalj abba a mappaba,
+ahova telepiteni szeretned a projektet. Peldaul:
+
+  cd C:\Manga
+
+Azutan klonozd le a forkolat repot:
+
+  git clone https://github.com/Kruscy/manga-image-translator
+
+Ez letrehoz egy "manga-image-translator" nevu mappat. Lepj bele:
+
+  cd manga-image-translator
+
+
+--------------------------------------------------------------------------------
+3. VIRTUALIS KORNYEZET LETREHOZASA ES AKTIVALASA
+--------------------------------------------------------------------------------
+
+A virtualis kornyezet (venv) elkülöníti a projekt fuggoségeit a rendszer
+Python telepitesetol - erosen ajanlott hasznalni.
+
+Letrehozas:
+  python -m venv venv
+
+Aktivalas (ezt minden uj parancssor-munkamenet elott meg kell tenni):
+  venv\Scripts\activate
+
+Sikeres aktivalas utan a parancssor elott megjelenik: (venv)
+
+Deaktivalas (ha kesobb ki szeretnel lepni):
+  deactivate
+
+
+--------------------------------------------------------------------------------
+4. FUGGOSEGEK TELEPITESE
+--------------------------------------------------------------------------------
+
+A virtualis kornyezet aktivalasa utan telepitsd a szukseges Python csomagokat:
+
+  pip install -r requirements.txt
+
+Ez az utasitas tobb percig is eltarthat, mivel tobb nagy csomag (pl. PyTorch)
+is letoltesre kerul. Türelmet kérünk.
+
+  [GPU hasznalatahoz - CUDA 11.8]
+  Ha CUDA-t szeretnel hasznalni, a PyTorch-ot kulön kell telepiteni:
+
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+  [GPU hasznalatahoz - CUDA 12.1]
+    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+
+--------------------------------------------------------------------------------
+5. KORNYEZETI VALTOZOK BEALLITASA (.env fajl)
+--------------------------------------------------------------------------------
+
+A program API kulcsokat es egyeb beallitasokat a .env nevű fajlbol olvas.
+
+Ha letezik .env.example fajl, masold at:
+  copy .env.example .env
+
+Ha nem letezik, hozd letre kezzel a projekt gyokermappajaban egy .env nevu
+szovegfajlt a kovetkezo tartalommal (szerkeszd a sajat kulcsaiddal):
+
+  # OpenAI API kulcs (GPT-alapu forditashoz szukseges)
+  OPENAI_API_KEY=ide_ird_az_openai_api_kulcsodat
+
+  # Torii API kulcs (ha Torii forditot hasznalsz)
+  TORII_API_KEY=ide_ird_a_torii_api_kulcsodat
+
+Hol szerezhetsz API kulcsot?
+  - OpenAI: https://platform.openai.com/api-keys
+  - Torii:  a Torii szolgaltatas weboldalan
+
+FONTOS: A .env fajlt soha ne oszd meg masokkal, es ne tolts fel nyilvanos
+        repoba - tartalmazza a privat API kulcsaidat!
+
+
+--------------------------------------------------------------------------------
+6. MODELLEK (models/ mappa)
+--------------------------------------------------------------------------------
+
+Az AI modellek (szovegfelismeres, forditasi modellek stb.) nincsenek benne
+a repoban - azok tul nagyok lennenek.
+
+Az ELSO FUTASKOR a program AUTOMATIKUSAN letolti a szukseges modelleket
+a models/ mappaba. Ez internethozzaferest igenyel, es az elso inditasnal
+hosszabb ideig tarthat (modelltol fuggoen tobb szaz MB - tobb GB).
+
+A models/ mappa utan nem kell ujra letolteni, kiveve ha torlod.
+
+
+--------------------------------------------------------------------------------
+7. TESZTELES - A PROGRAM ELINDITAS
+--------------------------------------------------------------------------------
+
+A virtualis kornyezet aktivalasa utan indítsd el a programot:
+
+  python start.py
+
+Webes felület (ajanlott):
+  python start.py --mode web
+
+Parancssori hasznalat egy kepen:
+  python start.py --mode local --input test.png
+
+GPU hasznalata (ha van NVIDIA GPU es CUDA):
+  python start.py --use-gpu
+
+Teljes parameter lista:
+  python start.py --help
+
+
+--------------------------------------------------------------------------------
+8. HIBAKERESES - GYAKORI PROBLEMAK
+--------------------------------------------------------------------------------
+
+  [Hiba: "torch not found" vagy "No module named torch"]
+  Megoldas: telepitsd a PyTorch-ot kezzel (lasd 4. pont GPU reszet), pl.:
+    pip install torch --index-url https://download.pytorch.org/whl/cu118
+  CPU-hoz (GPU nelkul):
+    pip install torch torchvision torchaudio
+
+  [Hiba: CUDA nem elerheto / "CUDA not available"]
+  Megoldas: Indítsd GPU hasznalata NELKUL:
+    python start.py  (--use-gpu kapcsolo nelkul)
+  Ellenorizd: nvidia-smi  es  nvcc --version
+  Bizonyosodj meg rola, hogy a PyTorch CUDA-s verzioját telepítetted-e.
+
+  [Hiba: "python not found" vagy "'python' is not recognized"]
+  Megoldas: A Python nincs a PATH-ban. Telepítsd ujra, es jelold be
+  az "Add Python to PATH" opciót. Vagy hasznald a teljes elerési utat.
+
+  [Hiba: "pip not found"]
+  Megoldas: python -m pip install -r requirements.txt  (pip helyett)
+
+  [Hiba: "git not found" / "'git' is not recognized"]
+  Megoldas: Telepitsd a Gitet (lasd 1.2 pont), majd indítsd ujra
+  a parancssort.
+
+  [Hiba: telepit kozben "Microsoft Visual C++ required"]
+  Megoldas: Telepítsd a Visual C++ Build Tools-t (lasd 1.4 pont).
+
+  [Hiba: ".env fajl nem talalhato" vagy API hiba]
+  Megoldas: Ellenorizd, hogy a .env fajl letezik-e a projekt
+  gyokermappajaban, es hogy az API kulcsok helyesek-e (lasd 5. pont).
+
+  [Az elso inditas nagyon lassu]
+  Ez normalis - a program letolti a szukseges modelleket. Varj türelmesen.
+
+
+--------------------------------------------------------------------------------
+9. FRISSITES
+--------------------------------------------------------------------------------
+
+A legujabb valtozatot a kovetkezo parancsokkal tolthetod le:
+
+  git pull origin main
+  pip install -r requirements.txt
+
+Vagy hasznald a mellekelt update.py szkriptet:
+
+  python update.py
+
+
+--------------------------------------------------------------------------------
+  Segitseg / Issues: https://github.com/Kruscy/manga-image-translator/issues
+================================================================================

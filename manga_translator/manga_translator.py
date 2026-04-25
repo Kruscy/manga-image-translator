@@ -89,11 +89,77 @@ def load_dictionary(file_path):
 
 def apply_dictionary(text, dictionary):
     for pattern, value, line_number in dictionary:
-        original_text = text  
+        original_text = text
         text = pattern.sub(value, text)
-        if text != original_text:  
+        if text != original_text:
             logger.info(f'Line {line_number}: Replaced "{original_text}" with "{text}" using pattern "{pattern.pattern}" and value "{value}"')
     return text
+
+def _deduplicate_textlines(textlines, iou_threshold=0.5):
+    """
+    Remove duplicate detected textlines whose bounding polygons overlap by more
+    than *iou_threshold* (Intersection-over-Union). When two boxes overlap too
+    much, only the one with the higher confidence score (prob) is kept.
+
+    This prevents the same visual text region from being OCR'd multiple times
+    and producing repeated phrases in the merged TextBlock text.
+    """
+    if len(textlines) <= 1:
+        return textlines
+
+    # Sort descending by confidence so that when we discard a duplicate we
+    # always keep the higher-quality detection.
+    sorted_tl = sorted(textlines, key=lambda t: t.prob, reverse=True)
+    keep = []
+
+    for candidate in sorted_tl:
+        try:
+            poly_c = candidate.polygon
+            area_c = candidate.area
+        except Exception:
+            keep.append(candidate)
+            continue
+
+        dominated = False
+        for kept in keep:
+            try:
+                poly_k = kept.polygon
+                area_k = kept.area
+                inter = poly_c.intersection(poly_k).area
+                union = area_c + area_k - inter
+                if union > 0 and inter / union > iou_threshold:
+                    dominated = True
+                    break
+            except Exception:
+                continue
+
+        if not dominated:
+            keep.append(candidate)
+
+    return keep
+
+def _add_unique(collected, tl, iou_thresh=0.4):
+    """
+    NMS-style append — only add *tl* to *collected* if it doesn't overlap
+    (IoU > iou_thresh) with any already-collected textline.
+    Returns True if the textline was added, False if it was suppressed.
+    """
+    try:
+        poly = tl.polygon
+        area = tl.area
+    except Exception:
+        collected.append(tl)
+        return True
+    for existing in collected:
+        try:
+            inter = poly.intersection(existing.polygon).area
+            union = area + existing.area - inter
+            if union > 0 and inter / union > iou_thresh:
+                return False  # already covered — skip
+        except Exception:
+            continue
+    collected.append(tl)
+    return True
 
 class MangaTranslator:
     verbose: bool
@@ -497,6 +563,12 @@ class MangaTranslator:
             ctx.result = ctx.upscaled
             return await self._revert_upscale(config, ctx)
 
+        # -- Deduplicate overlapping detections (IoU > 0.5 → keep highest-prob one)
+        before_count = len(ctx.textlines)
+        ctx.textlines = _deduplicate_textlines(ctx.textlines, iou_threshold=0.5)
+        after_count = len(ctx.textlines)
+        logger.info(f'[Detection] Textlines before dedup: {before_count}, after: {after_count} (removed {before_count - after_count})')
+
         if self.verbose:
             img_bbox_raw = np.copy(ctx.img_rgb)
             for txtln in ctx.textlines:
@@ -769,12 +841,28 @@ class MangaTranslator:
     async def _run_detection(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("detection", config.detector.detector)] = current_time
-        result = await dispatch_detection(config.detector.detector, ctx.img_rgb, config.detector.detection_size, config.detector.text_threshold,
+        textlines, raw_mask, mask = await dispatch_detection(config.detector.detector, ctx.img_rgb, config.detector.detection_size, config.detector.text_threshold,
                                         config.detector.box_threshold,
                                         config.detector.unclip_ratio, config.detector.det_invert, config.detector.det_gamma_correct, config.detector.det_rotate,
                                         config.detector.det_auto_rotate,
                                         self.device, self.verbose)
-        return result
+
+        # Run any secondary detectors and merge results (NMS dedup via _add_unique)
+        for sec_det in config.detector.secondary_detectors:
+            if sec_det == config.detector.detector:
+                continue
+            sec_tls, _, _ = await dispatch_detection(
+                sec_det, ctx.img_rgb,
+                config.detector.detection_size, config.detector.text_threshold,
+                config.detector.box_threshold, config.detector.unclip_ratio,
+                config.detector.det_invert, config.detector.det_gamma_correct,
+                config.detector.det_rotate, config.detector.det_auto_rotate,
+                self.device, False
+            )
+            added = sum(1 for tl in sec_tls if _add_unique(textlines, tl))
+            logger.info(f'[Detection] Secondary detector {sec_det}: {len(sec_tls)} találat, {added} új hozzáadva')
+
+        return textlines, raw_mask, mask
 
     async def _run_detection_with_bubble_fallback(self, config: Config, ctx: Context):
         """
@@ -795,7 +883,18 @@ class MangaTranslator:
         await detector.load(self.device)
         bubble_regions = detector.detect_regions(ctx.img_rgb, config.detector.bubble_prefilter_confidence)
 
-        bubble_boxes = []  # (bx1, by1, bx2, by2, label)
+        # Helper: axis-aligned IoU for bubble boxes (fast, no Shapely needed)
+        def _box_iou(a, b):
+            ax1, ay1, ax2, ay2, _ = a
+            bx1, by1, bx2, by2, _ = b
+            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            union = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
+            return inter / union if union > 0 else 0.0
+
+        # Collect all raw bubble boxes
+        bubble_boxes_raw = []
         for box, label in bubble_regions:
             if label == 0:
                 continue
@@ -803,13 +902,22 @@ class MangaTranslator:
             bx1, by1 = max(0, bx1), max(0, by1)
             bx2, by2 = min(w, bx2), min(h, by2)
             if bx2 > bx1 and by2 > by1:
-                bubble_boxes.append((bx1, by1, bx2, by2, label))
+                bubble_boxes_raw.append((bx1, by1, bx2, by2, label))
 
-        logger.info(f'[Detection] Bubble detector: {len(bubble_boxes)} régió')
+        # Deduplicate bubble boxes with IoU > 0.5 before running crop CTD.
+        # This prevents the same physical bubble from triggering N independent
+        # crop-CTD runs and adding N copies of the same textlines.
+        bubble_boxes = []
+        for cand in bubble_boxes_raw:
+            if not any(_box_iou(cand, kept) > 0.5 for kept in bubble_boxes):
+                bubble_boxes.append(cand)
 
-        # Step 2 – CTD a teljes képen
+        logger.info(f'[Detection] Bubble detector: {len(bubble_boxes_raw)} régió → dedup után: {len(bubble_boxes)}')
+
+        # Step 2 – Primary + secondary detectors a teljes képen
+        # _run_detection already merges secondary_detectors results via _add_unique
         ctd_textlines, raw_mask, mask = await self._run_detection(config, ctx)
-        logger.info(f'[Detection] CTD (teljes kép): {len(ctd_textlines)} régió')
+        logger.info(f'[Detection] Detektorok (teljes kép): {len(ctd_textlines)} régió (primary + {len(config.detector.secondary_detectors)} secondary)')
 
         # Rendeljük hozzá a CTD dobozokat a bubble régiókhoz
         bubble_ctd_map = {i: [] for i in range(len(bubble_boxes))}
@@ -826,37 +934,77 @@ class MangaTranslator:
             if not matched:
                 outside_ctd.append(tl)
 
-        # Step 3 – bubble régiónként: ha CTD talált benne valamit → használjuk azt;
-        #          ha nem → CTD a kivágott területen, majd fallback
-        textlines = list(outside_ctd)
-        for i, (bx1, by1, bx2, by2, b_label) in enumerate(bubble_boxes):
-            label_name = {1: 'text_bubble', 2: 'text_free'}.get(b_label, 'unknown')
-            if bubble_ctd_map[i]:
-                textlines.extend(bubble_ctd_map[i])
-                logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort talált')
-            else:
-                # CTD nem talált semmit a buborékban → próbáljuk a kivágaton
-                crop = ctx.img_rgb[by1:by2, bx1:bx2]
-                crop_tls, _, _ = await dispatch_detection(
-                    config.detector.detector, crop,
+        def _offset_tls(tls, ox, oy):
+            result = []
+            for tl in tls:
+                offset_pts = tl.pts.copy().astype(np.int32)
+                offset_pts[:, 0] += ox
+                offset_pts[:, 1] += oy
+                result.append(Quadrilateral(offset_pts, '', tl.prob))
+            return result
+
+        all_crop_detectors = [config.detector.detector] + [
+            d for d in config.detector.secondary_detectors
+            if d != config.detector.detector
+        ]
+
+        async def _run_crop_ctd(crop, bx1, by1):
+            """Crop CTD futtatása és koordináta-eltolás alkalmazása."""
+            combined = []
+            for crop_det in all_crop_detectors:
+                raw, _, _ = await dispatch_detection(
+                    crop_det, crop,
                     config.detector.detection_size, config.detector.text_threshold,
                     config.detector.box_threshold, config.detector.unclip_ratio,
                     config.detector.det_invert, config.detector.det_gamma_correct,
                     config.detector.det_rotate, config.detector.det_auto_rotate,
                     self.device, False
                 )
-                if crop_tls:
-                    for tl in crop_tls:
-                        # koordinátákat visszatranszformáljuk az eredeti képre
-                        offset_pts = tl.pts.copy().astype(np.int32)
-                        offset_pts[:, 0] += bx1
-                        offset_pts[:, 1] += by1
-                        textlines.append(Quadrilateral(offset_pts, '', tl.prob))
-                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: crop CTD {len(crop_tls)} sort talált')
+                for tl in _offset_tls(raw, bx1, by1):
+                    _add_unique(combined, tl)
+            return combined
+
+        # Step 3 – bubble régiónként
+        textlines = list(outside_ctd)
+        for i, (bx1, by1, bx2, by2, b_label) in enumerate(bubble_boxes):
+            label_name = {1: 'text_bubble', 2: 'text_free'}.get(b_label, 'unknown')
+            if bubble_ctd_map[i]:
+                # Teljes képes CTD talált sorokat → hozzáadjuk
+                for tl in bubble_ctd_map[i]:
+                    _add_unique(textlines, tl)
+
+                # Crop CTD kiegészítőként: megtalálhatja azokat a sorokat, amelyeket
+                # a teljes képes CTD kihagyott (pl. kisebb/halványabb szöveg).
+                # IoU-t csak az ebben a buborékban már megtalált sorok ellen ellenőrizzük,
+                # NEM a globális textlines lista ellen, hogy elkerüljük a hamis elnyomást.
+                crop = ctx.img_rgb[by1:by2, bx1:bx2]
+                crop_supplement = await _run_crop_ctd(crop, bx1, by1)
+                local_found = list(bubble_ctd_map[i])
+                extra = 0
+                for tl in crop_supplement:
+                    # _add_unique már hozzáfűzi tl-t local_found-hoz ha egyedi
+                    if _add_unique(local_found, tl) and _add_unique(textlines, tl):
+                        extra += 1
+                if extra:
+                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort + crop +{extra} kiegészítő')
+                else:
+                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort talált')
+            else:
+                # Detektorok nem találtak semmit a buborékban → próbáljuk a kivágaton
+                crop = ctx.img_rgb[by1:by2, bx1:bx2]
+                crop_tls_combined = await _run_crop_ctd(crop, bx1, by1)
+
+                if crop_tls_combined:
+                    # Ne ellenőrizzük IoU-t a globális textlines ellen itt —
+                    # az outside_ctd bejegyzések középpontja kívül eshet ezen a buborékon,
+                    # miközben dobozuk belenyúlik, és hamisan elnyomná a crop eredményeket.
+                    # A _deduplicate_textlines (detekció után) kezeli az igazi duplikátokat.
+                    textlines.extend(crop_tls_combined)
+                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: crop {len(crop_tls_combined)} találat hozzáadva')
                 else:
                     # Fallback: a teljes bubble régiót adjuk hozzá
                     pts = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]], dtype=np.int32)
-                    textlines.append(Quadrilateral(pts, '', 0.9))
+                    _add_unique(textlines, Quadrilateral(pts, '', 0.9))
                     logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: fallback, teljes régió hozzáadva')
 
         logger.info(f'[Detection] Végeredmény: {len(textlines)} régió')

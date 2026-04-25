@@ -694,6 +694,8 @@ class TranslatorStudioApp(QMainWindow):
                 widget = self._create_api_manager_widget(info)
             elif widget_type == "grid_segmented_button":
                 widget = self._create_grid_segmented_button(info)
+            elif widget_type == "multi_segmented_button":
+                widget = self._create_multi_segmented_button(info)
             elif widget_type == "preset_manager":
                 widget = self._create_preset_manager(info)
             else:
@@ -1099,6 +1101,26 @@ class TranslatorStudioApp(QMainWindow):
 
         return container
 
+    def _create_multi_segmented_button(self, info: dict) -> QWidget:
+        """Creates a row of toggleable buttons where multiple can be selected at once."""
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        button_group = QButtonGroup(container)
+        button_group.setExclusive(False)  # Allow multiple selections
+
+        values = info.get("values", [])
+        for val in values:
+            button = QPushButton(val)
+            button.setCheckable(True)
+            layout.addWidget(button)
+            button_group.addButton(button)
+
+        layout.addStretch()
+        return container
+
     def _create_preset_manager(self, info: dict) -> QWidget:
         """Creates the preset management compound widget."""
         preset_frame = QFrame()
@@ -1487,7 +1509,7 @@ class TranslatorStudioApp(QMainWindow):
         elif isinstance(widget, QLineEdit):
             # editingFinished has no arguments, so it works perfectly.
             widget.editingFinished.connect(handler)
-        elif widget_type in ["segmented_button", "grid_segmented_button"]:
+        elif widget_type in ["segmented_button", "grid_segmented_button", "multi_segmented_button"]:
             button_group = widget.findChild(QButtonGroup)
             if button_group:
                 button_group.buttonClicked.connect(handler)
@@ -1602,6 +1624,11 @@ class TranslatorStudioApp(QMainWindow):
                         return int(value.replace("x", ""))
                 return value
             return None  # Return None if no button is checked
+        elif widget_type == "multi_segmented_button":
+            button_group = widget.findChild(QButtonGroup)
+            if button_group:
+                return [btn.text() for btn in button_group.buttons() if btn.isChecked()]
+            return []
         elif key == "language_checkbox_grid":
             checkbox_dict = self.widget_references.get(key, {})
             selected = [code for code, cb in checkbox_dict.items() if cb.isChecked()]
@@ -1672,6 +1699,12 @@ class TranslatorStudioApp(QMainWindow):
                     if button.text() == value_to_check:
                         button.setChecked(True)
                         break
+        elif widget_type == "multi_segmented_button":
+            button_group = widget.findChild(QButtonGroup)
+            if button_group:
+                selected = set(value) if isinstance(value, (list, tuple)) else set()
+                for button in button_group.buttons():
+                    button.setChecked(button.text() in selected)
         elif key == "language_checkbox_grid":
             checkbox_dict = self.widget_references.get(key, {})
             selected_langs = set(str(value).split(','))

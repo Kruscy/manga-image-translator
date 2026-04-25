@@ -94,6 +94,7 @@ class Inpainter(str, Enum):
     lama_large = "lama_large"
     lama_mpe = "lama_mpe"
     sd = "sd"
+    lama2 = "lama2"
     none = "none"
     original = "original"
     torii = "torii"
@@ -288,6 +289,8 @@ class DetectorConfig(BaseModel):
     """"""
     detector: Detector =Detector.default
     """"Text detector used for creating a text mask from an image, DO NOT use craft for manga, it\'s not designed for it"""
+    secondary_detectors: List[Detector] = []
+    """Additional text detectors to run after the primary detector. Results are merged using NMS (no duplicate boxes). Useful for manhwa/manhua where a single detector may miss text. Example: ["dbconvnext", "paddle"]"""
     detection_size: int = 2048
     """Size of image used for detection"""
     text_threshold: float = 0.5
