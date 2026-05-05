@@ -22,6 +22,7 @@ from .utils import (
     ModelWrapper,
     Context,
     Quadrilateral,
+    TextBlock,
     load_image,
     dump_image,
     visualize_textblocks,
@@ -160,6 +161,76 @@ def _add_unique(collected, tl, iou_thresh=0.4):
             continue
     collected.append(tl)
     return True
+
+
+def _merge_textblock_group(group: List['TextBlock']) -> 'TextBlock':
+    """Merge a list of TextBlocks from the same bubble into one TextBlock."""
+    if len(group) == 1:
+        return group[0]
+    group_sorted = sorted(group, key=lambda r: r.center[1])
+    all_lines = []
+    all_texts = []
+    for region in group_sorted:
+        all_lines.extend(list(region.lines))
+        all_texts.extend(list(region.texts))
+    if not all_lines or not all_texts:
+        return group[0]
+    fg = tuple(round(sum(r.fg_colors[i] for r in group) / len(group)) for i in range(3))
+    bg = tuple(round(sum(r.bg_colors[i] for r in group) / len(group)) for i in range(3))
+    merged = TextBlock(
+        lines=all_lines,
+        texts=all_texts,
+        font_size=min(r.font_size for r in group),
+        angle=sum(r.angle for r in group) / len(group),
+        prob=max(r.prob for r in group),
+        fg_color=fg,
+        bg_color=bg,
+    )
+    merged.target_lang = group[0].target_lang
+    return merged
+
+
+def _force_merge_same_bubble_text_regions(
+    text_regions: List['TextBlock'],
+    bubble_boxes: list,
+) -> List['TextBlock']:
+    """
+    Group TextBlocks by which bubble box their center falls in, then
+    force-merge all TextBlocks within the same bubble into one.
+    Prevents the same speech bubble from being rendered multiple times.
+    """
+    if not bubble_boxes or not text_regions:
+        return text_regions
+
+    from collections import defaultdict
+    bubble_groups: dict = defaultdict(list)
+    no_bubble: List['TextBlock'] = []
+
+    for region in text_regions:
+        cx, cy = region.center
+        assigned = False
+        for i, (bx1, by1, bx2, by2, _) in enumerate(bubble_boxes):
+            if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                bubble_groups[i].append(region)
+                assigned = True
+                break
+        if not assigned:
+            no_bubble.append(region)
+
+    result = list(no_bubble)
+    merged_count = 0
+    for group in bubble_groups.values():
+        if len(group) > 1:
+            result.append(_merge_textblock_group(group))
+            merged_count += len(group) - 1
+        else:
+            result.extend(group)
+
+    if merged_count:
+        logger.info(f'[TextlineMerge] Buborék-alapú összevonás: {merged_count} TextBlock eltávolítva')
+
+    return result
+
 
 class MangaTranslator:
     verbose: bool
@@ -982,8 +1053,9 @@ class MangaTranslator:
                 local_found = list(bubble_ctd_map[i])
                 extra = 0
                 for tl in crop_supplement:
-                    # _add_unique már hozzáfűzi tl-t local_found-hoz ha egyedi
-                    if _add_unique(local_found, tl) and _add_unique(textlines, tl):
+                    # Tighter IoU (0.2) rejects near-duplicate crop results that
+                    # cover the same row as an existing full-image detection.
+                    if _add_unique(local_found, tl, iou_thresh=0.2) and _add_unique(textlines, tl, iou_thresh=0.2):
                         extra += 1
                 if extra:
                     logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort + crop +{extra} kiegészítő')
@@ -1008,6 +1080,7 @@ class MangaTranslator:
                     logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: fallback, teljes régió hozzáadva')
 
         logger.info(f'[Detection] Végeredmény: {len(textlines)} régió')
+        ctx.bubble_boxes = bubble_boxes
         return textlines, raw_mask, mask
 
     async def _unload_model(self, tool: str, model: str):
@@ -1066,8 +1139,8 @@ class MangaTranslator:
         if ocr_result_dir:
             os.environ['MANGA_OCR_RESULT_DIR'] = ocr_result_dir
         
-        # Save region debug images when secondary OCR is configured
-        if config.ocr.secondary_ocr and config.ocr.secondary_ocr != config.ocr.ocr:
+        # Save region debug images only in verbose mode
+        if self.verbose and config.ocr.secondary_ocr and config.ocr.secondary_ocr != config.ocr.ocr:
             self._save_ocr_region_debug(ctx.img_rgb, ctx.textlines)
 
         try:
@@ -1207,8 +1280,11 @@ class MangaTranslator:
                 filtered_textlines.append(txtln)  
             ctx.textlines = filtered_textlines  
     
-        text_regions = await dispatch_textline_merge(ctx.textlines, ctx.img_rgb.shape[1], ctx.img_rgb.shape[0],  
-                                                     verbose=self.verbose)  
+        text_regions = await dispatch_textline_merge(ctx.textlines, ctx.img_rgb.shape[1], ctx.img_rgb.shape[0],
+                                                     verbose=self.verbose)
+
+        # Force-merge TextBlocks that share the same speech bubble so they render as one unit.
+        text_regions = _force_merge_same_bubble_text_regions(text_regions, ctx.bubble_boxes or [])
 
         new_text_regions = []
         for region in text_regions:
@@ -1755,6 +1831,12 @@ class MangaTranslator:
                 if region.translation.strip():
                     logger.info(f'Filtered out: {region.translation}')
                     logger.info(f'Reason: {filter_reason}')
+                    if filter_reason == "Translation identical to original":
+                        logger.warning(
+                            f'[Filter] A fordítás megegyezik az eredetivel — '
+                            f'valószínűleg a GPT nem fordított le egy nem-forrás-nyelvű szöveget. '
+                            f'Szöveg: "{region.text[:80]}"'
+                        )
             else:
                 new_text_regions.append(region)
 

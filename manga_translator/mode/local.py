@@ -15,6 +15,7 @@ from ..translators import (
     dispatch as dispatch_translation,
 )
 from ..utils import natural_sort, replace_prefix, get_color_name, rgb2hex, get_logger
+from ..manga_context import get_manga_context, set_current_context, clean_folder_title
 
 # 使用专用的local logger
 logger = get_logger('local')
@@ -157,7 +158,21 @@ class MangaTranslatorLocal(MangaTranslator):
                 # 原有的逐个处理方式
                 start_time = time.time()  # 记录开始时间
                 translated_count = 0
+                _last_manga_folder = None
                 for root, subdirs, files in os.walk(path):
+                    # Manga context: az első szintű almappa neve = manga cím
+                    rel = os.path.relpath(root, path)
+                    parts = rel.split(os.sep)
+                    manga_folder = parts[0] if parts[0] != '.' else ''
+                    if manga_folder and manga_folder != _last_manga_folder:
+                        _last_manga_folder = manga_folder
+                        try:
+                            ctx_str = await get_manga_context(manga_folder)
+                            set_current_context(ctx_str)
+                        except Exception as _e:
+                            logger.debug(f'[MangaContext] Hiba: {_e}')
+                            set_current_context(None)
+
                     files = natural_sort(files)
                     dest_root = replace_prefix(root, path, _dest)
                     os.makedirs(dest_root, exist_ok=True)

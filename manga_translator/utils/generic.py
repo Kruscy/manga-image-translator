@@ -660,6 +660,15 @@ def quadrilateral_can_merge_region(a: Quadrilateral, b: Quadrilateral, ratio = 1
     p1 = Polygon(a.pts)
     p2 = Polygon(b.pts)
     dist = p1.distance(p2)
+    # Containment override: if one polygon is largely inside the other (different
+    # detectors finding the same region at different scales/angles), always merge.
+    try:
+        inter_area = p1.intersection(p2).area
+        min_area = min(p1.area, p2.area)
+        if min_area > 0 and inter_area / min_area > 0.5:
+            return True
+    except Exception:
+        pass
     if dist > discard_connection_gap * char_size:
         return False
     if max(a.font_size, b.font_size) / char_size > font_size_ratio_tol:

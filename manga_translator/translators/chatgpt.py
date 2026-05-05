@@ -665,12 +665,22 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         """
         The actual request part that calls openai.ChatCompletion.
         Incorporate the glossary function.
-        """        
+        """
         lang_name = self._LANGUAGE_CODE_MAP.get(to_lang, to_lang) if to_lang in self._LANGUAGE_CODE_MAP else to_lang
-                
+
+        # Manga context (opcionális, mappanév alapján AniList-ről)
+        try:
+            from manga_translator.manga_context import get_current_context
+            manga_ctx = get_current_context()
+        except Exception:
+            manga_ctx = None
+        manga_ctx_block = (
+            f'\n\n## Current Manga\n{manga_ctx}' if manga_ctx else ''
+        )
+
         # 构建 messages / Construct messages
-        messages = [  
-            {            
+        messages = [
+            {
                 'role': 'system',
                 'content': self.chat_system_template.format(to_lang=lang_name) +
                 "\nReturn ONLY the translations.\n"
@@ -678,10 +688,12 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 "Keep the <|number|> prefix exactly as given.\n"
                 "Do not merge lines.\n"
                 "Do not add explanations.\n"
+                f"Translate EVERY segment into {lang_name} — including segments that appear to already be in English or another language. Full sentences and dialogue must always be translated.\n"
                 "Fordíts természetes, folyékony magyar nyelvre, ne szó szerint.\n"
                 "Használj hétköznapi, beszélt magyar stílust.\n"
                 "Ha a szó szerinti fordítás furcsán hangzik, fogalmazd át.\n"
-            },  
+                + manga_ctx_block
+            },
         ]  
 
         # 提取相关术语并添加到系统消息中  / Extract relevant terms and add them to the system message
