@@ -64,4 +64,15 @@ class Executors:
         self.event.clear()
         await task_queue.update_event()
 
+    async def wait_for_specific_executor(self, instance: ExecutorInstance) -> ExecutorInstance:
+        """Wait until a specific executor is free, then mark it busy and return it.
+        Does not hold self.lock while sleeping so other find_executor calls can proceed."""
+        while True:
+            async with self.lock:
+                if not instance.busy:
+                    instance.busy = True
+                    return instance
+            # Release lock before waiting so find_executor can proceed in parallel
+            await self.event.wait()
+
 executor_instances: Executors = Executors()

@@ -45,5 +45,12 @@ async def dispatch(inpainter_key: Inpainter, image: np.ndarray, mask: np.ndarray
     config = config or InpainterConfig()
     return await inpainter.inpaint(image, mask, config, inpainting_size, verbose)
 
+async def dispatch_batch(inpainter_key: Inpainter, images: list, masks: list, config: Optional[InpainterConfig], inpainting_size: int = 1024, device: str = 'cpu') -> list:
+    inpainter = get_inpainter(inpainter_key)
+    if isinstance(inpainter, OfflineInpainter):
+        await inpainter.load(device)
+    config = config or InpainterConfig()
+    return await inpainter.inpaint_batch(images, masks, config, inpainting_size)
+
 async def unload(inpainter_key: Inpainter):
     inpainter_cache.pop(inpainter_key, None)

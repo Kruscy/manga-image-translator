@@ -13,6 +13,11 @@ class CommonInpainter(InfererModule):
     async def _inpaint(self, image: np.ndarray, mask: np.ndarray, config: InpainterConfig, inpainting_size: int = 1024, verbose: bool = False) -> np.ndarray:
         pass
 
+    async def inpaint_batch(self, images: list, masks: list, config: InpainterConfig, inpainting_size: int = 1024) -> list:
+        if hasattr(self, '_infer_batch'):
+            return await self._infer_batch(images, masks, config, inpainting_size)
+        return [await self._inpaint(img, mask, config, inpainting_size) for img, mask in zip(images, masks)]
+
 class OfflineInpainter(CommonInpainter, ModelWrapper):
     _MODEL_SUB_DIR = 'inpainting'
 

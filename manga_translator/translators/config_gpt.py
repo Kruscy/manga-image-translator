@@ -368,8 +368,24 @@ class ConfigGPT:
     @property
     def top_p(self) -> float:
         return self._config_get('top_p', default=1)
-    
-    @property  
+
+    @property
+    def max_output_tokens(self) -> int:
+        return self._config_get('max_output_tokens', default=4000)
+
+    @property
+    def reasoning_effort(self) -> str:
+        return self._config_get('reasoning_effort', default='low')
+
+    @property
+    def request_timeout(self) -> int:
+        return self._config_get('request_timeout', default=90)
+
+    @property
+    def use_chat_completions(self) -> bool:
+        return self._config_get('use_chat_completions', default=False)
+
+    @property
     def verbose_logging(self) -> bool:  
         return self._config_get('verbose_logging', default=False)  
 

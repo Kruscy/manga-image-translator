@@ -20,8 +20,9 @@ from pathlib import Path
 from manga_translator import Config
 from server.instance import ExecutorInstance, executor_instances
 from server.myqueue import task_queue
-from server.request_extraction import get_ctx, while_streaming, TranslateRequest, BatchTranslateRequest, get_batch_ctx
+from server.request_extraction import get_ctx, while_streaming, TranslateRequest, BatchTranslateRequest, get_batch_ctx, parse_config_or_default
 from server.to_json import to_translation, TranslationResponse
+from server.pipeline_orchestrator import translate_with_pipeline
 
 app = FastAPI()
 nonce = None
@@ -102,33 +103,33 @@ async def stream_image(req: Request, data: TranslateRequest) -> StreamingRespons
 @app.post("/translate/with-form/json", response_model=TranslationResponse, tags=["api", "form"],response_description="json strucure inspired by the ichigo translator extension")
 async def json_form(req: Request, image: UploadFile = File(...), config: str = Form("{}")):
     img = await image.read()
-    conf = Config.parse_raw(config)
+    conf = parse_config_or_default(config)
     ctx = await get_ctx(req, conf, img)
     return to_translation(ctx)
 
 @app.post("/translate/with-form/bytes", response_class=StreamingResponse, tags=["api", "form"],response_description="custom byte structure for decoding look at examples in 'examples/response.*'")
 async def bytes_form(req: Request, image: UploadFile = File(...), config: str = Form("{}")):
     img = await image.read()
-    conf = Config.parse_raw(config)
+    conf = parse_config_or_default(config)
     ctx = await get_ctx(req, conf, img)
     return StreamingResponse(content=to_translation(ctx).to_bytes())
 
 @app.post("/translate/with-form/image", response_description="the result image", tags=["api", "form"],response_class=StreamingResponse)
 async def image_form(req: Request, image: UploadFile = File(...), config: str = Form("{}")) -> StreamingResponse:
+    from server.request_extraction import to_pil_image
     img = await image.read()
-    conf = Config.parse_raw(config)
-    ctx = await get_ctx(req, conf, img)
+    pil_image = await to_pil_image(img)
+    conf = parse_config_or_default(config)
+    ctx = await translate_with_pipeline(pil_image, conf, nonce)
     img_byte_arr = io.BytesIO()
     ctx.result.save(img_byte_arr, format="PNG")
     img_byte_arr.seek(0)
-
     return StreamingResponse(img_byte_arr, media_type="image/png")
 
 @app.post("/translate/with-form/json/stream", response_class=StreamingResponse, tags=["api", "form"],response_description="A stream over elements with strucure(1byte status, 4 byte size, n byte data) status code are 0,1,2,3,4 0 is result data, 1 is progress report, 2 is error, 3 is waiting queue position, 4 is waiting for translator instance")
 async def stream_json_form(req: Request, image: UploadFile = File(...), config: str = Form("{}")) -> StreamingResponse:
     img = await image.read()
-    conf = Config.parse_raw(config)
-    # 标记这是Web前端调用，用于占位符优化
+    conf = parse_config_or_default(config)
     conf._is_web_frontend = True
     return await while_streaming(req, transform_to_json, conf, img)
 
@@ -137,30 +138,54 @@ async def stream_json_form(req: Request, image: UploadFile = File(...), config: 
 @app.post("/translate/with-form/bytes/stream", response_class=StreamingResponse,tags=["api", "form"], response_description="A stream over elements with strucure(1byte status, 4 byte size, n byte data) status code are 0,1,2,3,4 0 is result data, 1 is progress report, 2 is error, 3 is waiting queue position, 4 is waiting for translator instance")
 async def stream_bytes_form(req: Request, image: UploadFile = File(...), config: str = Form("{}"))-> StreamingResponse:
     img = await image.read()
-    conf = Config.parse_raw(config)
+    conf = parse_config_or_default(config)
     return await while_streaming(req, transform_to_bytes, conf, img)
 
 @app.post("/translate/with-form/image/stream", response_class=StreamingResponse, tags=["api", "form"], response_description="Standard streaming endpoint - returns complete image data. Suitable for API calls and scripts.")
 async def stream_image_form(req: Request, image: UploadFile = File(...), config: str = Form("{}")) -> StreamingResponse:
     """通用流式端点：返回完整图片数据，适用于API调用和comicread脚本"""
     img = await image.read()
-    conf = Config.parse_raw(config)
-    # 标记为通用模式，不使用占位符优化
+    conf = parse_config_or_default(config)
     conf._web_frontend_optimized = False
     return await while_streaming(req, transform_to_image, conf, img)
 
 @app.post("/translate/with-form/image/stream/web", response_class=StreamingResponse, tags=["api", "form"], response_description="Web frontend optimized streaming endpoint - uses placeholder optimization for faster response.")
 async def stream_image_form_web(req: Request, image: UploadFile = File(...), config: str = Form("{}")) -> StreamingResponse:
-    """Web前端专用端点：使用占位符优化，提供极速体验"""
+    """Web前端专用端点：使用占位符优化，提供极速体験"""
     img = await image.read()
-    conf = Config.parse_raw(config)
-    # 标记为Web前端优化模式，使用占位符优化
+    conf = parse_config_or_default(config)
     conf._web_frontend_optimized = True
     return await while_streaming(req, transform_to_image, conf, img)
+
+@app.post("/translate/pipeline/image", response_class=StreamingResponse, tags=["api", "pipeline"],
+          response_description="Two-stage pipeline: Stage1(GPU) + Translation(API pool) + Stage2(GPU). Faster throughput with multiple API keys.")
+async def pipeline_image(req: Request, image: UploadFile = File(...), config: str = Form("{}")) -> StreamingResponse:
+    """Two-stage pipeline endpoint. Stage1 (GPU detect+OCR) releases the worker during GPT translation,
+    allowing other images to be processed in parallel. Stage2 (inpaint+render) runs after translation."""
+    from server.request_extraction import to_pil_image
+    img_bytes = await image.read()
+    pil_image = await to_pil_image(img_bytes)
+    conf = parse_config_or_default(config)
+    ctx = await translate_with_pipeline(pil_image, conf, nonce)
+    img_byte_arr = io.BytesIO()
+    ctx.result.save(img_byte_arr, format="PNG")
+    img_byte_arr.seek(0)
+    return StreamingResponse(img_byte_arr, media_type="image/png")
 
 @app.post("/queue-size", response_model=int, tags=["api", "json"])
 async def queue_size() -> int:
     return len(task_queue.queue)
+
+@app.get("/status", tags=["api", "json"])
+async def status():
+    total = len(executor_instances.list)
+    busy = len([w for w in executor_instances.list if w.busy])
+    return {
+        "workers_total": total,
+        "workers_busy": busy,
+        "workers_free": total - busy,
+        "queue_waiting": len(task_queue.queue),
+    }
 
 
 @app.api_route("/result/{folder_name}/final.png", methods=["GET", "HEAD"], tags=["api", "file"])
@@ -246,7 +271,7 @@ def start_translator_client_proc(host: str, port: int, nonce: str, params: Names
         sys.executable,
         '-m', 'manga_translator',
         'shared',
-        '--host', host,
+        '--host', '127.0.0.1',
         '--port', str(port),
         '--nonce', nonce,
     ]
@@ -263,19 +288,11 @@ def start_translator_client_proc(host: str, port: int, nonce: str, params: Names
     if getattr(params, 'pre_dict', None):
         cmds.extend(['--pre-dict', params.pre_dict])
     if getattr(params, 'post_dict', None):
-        cmds.extend(['--post-dict', params.post_dict])       
+        cmds.extend(['--post-dict', params.post_dict])
     base_path = os.path.dirname(os.path.abspath(__file__))
     parent = os.path.dirname(base_path)
     proc = subprocess.Popen(cmds, cwd=parent)
-    executor_instances.register(ExecutorInstance(ip=host, port=port))
-
-    def handle_exit_signals(signal, frame):
-        proc.terminate()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, handle_exit_signals)
-    signal.signal(signal.SIGTERM, handle_exit_signals)
-
+    executor_instances.register(ExecutorInstance(ip='127.0.0.1', port=port))
     return proc
 
 def prepare(args):
@@ -285,7 +302,21 @@ def prepare(args):
     else:
         nonce = args.nonce
     if args.start_instance:
-        return start_translator_client_proc(args.host, args.port + 1, nonce, args)
+        workers = getattr(args, 'workers', 1)
+        procs = []
+        for i in range(workers):
+            proc = start_translator_client_proc(args.host, args.port + 1 + i, nonce, args)
+            procs.append(proc)
+
+        def handle_exit_signals(sig, frame):
+            for p in procs:
+                p.terminate()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, handle_exit_signals)
+        signal.signal(signal.SIGTERM, handle_exit_signals)
+
+        return procs
     folder_name= "upload-cache"
     if os.path.exists(folder_name):
         shutil.rmtree(folder_name)
@@ -392,10 +423,11 @@ if __name__ == '__main__':
 
     args = parse_arguments()
     args.start_instance = True
-    proc = prepare(args)
-    print("Nonce: "+nonce)
+    procs = prepare(args)
+    print("Nonce: " + nonce)
     try:
         uvicorn.run(app, host=args.host, port=args.port)
-    except Exception:
-        if proc:
-            proc.terminate()
+    finally:
+        if procs:
+            for p in procs:
+                p.terminate()

@@ -36,7 +36,7 @@ from .upscaling import dispatch as dispatch_upscaling, prepare as prepare_upscal
 from .ocr import dispatch as dispatch_ocr, prepare as prepare_ocr, unload as unload_ocr
 from .textline_merge import dispatch as dispatch_textline_merge
 from .mask_refinement import dispatch as dispatch_mask_refinement
-from .inpainting import dispatch as dispatch_inpainting, prepare as prepare_inpainting, unload as unload_inpainting
+from .inpainting import dispatch as dispatch_inpainting, dispatch_batch as dispatch_inpainting_batch, prepare as prepare_inpainting, unload as unload_inpainting
 from .translators import (
     dispatch as dispatch_translation,
     prepare as prepare_translation,
@@ -288,7 +288,10 @@ class MangaTranslator:
         self._current_image_context = None  # 存储当前处理图片的上下文信息
         self._saved_image_contexts = {}     # 存储批量处理中每个图片的上下文信息
         self._current_input_filename = 'unknown'  # Set by local.py before each translate() call
-        
+
+        # Two-stage pipeline: stores Context between stage1 and stage2
+        self._pending_contexts: dict = {}  # job_id → Context
+
         # 设置日志文件
         self._setup_log_file()
 
@@ -570,6 +573,240 @@ class MangaTranslator:
 
         return ctx
 
+    async def translate_stage1(self, image: 'Image.Image', config: Config) -> dict:
+        """Two-stage pipeline Stage 1: detect + OCR + merge + pre-dict.
+        Stores the Context in _pending_contexts and returns the OCR texts for external translation."""
+        import uuid as _uuid
+
+        ctx = Context()
+        ctx.input = image
+        ctx.result = None
+        ctx.verbose = self.verbose
+        ctx.result_sub_folder = ''
+
+        self._set_image_context(config, image)
+        ctx.debug_folder = self._get_image_subfolder()
+
+        if self.models_ttl == 0:
+            await prepare_detection(config.detector.detector)
+            await prepare_ocr(config.ocr.ocr, self.device)
+            await prepare_inpainting(config.inpainter.inpainter, self.device)
+
+        # Colorization (skip — not needed for web pipeline)
+        ctx.img_colorized = ctx.input
+
+        # Upscaling
+        if config.upscale.upscale_ratio:
+            await self._report_progress('upscaling')
+            try:
+                ctx.upscaled = await self._run_upscaling(config, ctx)
+            except Exception:
+                ctx.upscaled = ctx.img_colorized
+        else:
+            ctx.upscaled = ctx.img_colorized
+
+        ctx.img_rgb, ctx.img_alpha = load_image(ctx.upscaled)
+
+        # Detection
+        await self._report_progress('detection')
+        try:
+            if config.detector.use_bubble_prefilter:
+                ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection_with_bubble_fallback(config, ctx)
+            else:
+                ctx.textlines, ctx.mask_raw, ctx.mask = await self._run_detection(config, ctx)
+        except Exception:
+            logger.error(f"Stage1 detection error:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.textlines = []
+            ctx.mask_raw = None
+            ctx.mask = None
+
+        if not ctx.textlines:
+            ctx.result = ctx.upscaled
+            return {'job_id': None, 'texts': [], 'from_lang': 'unknown'}
+
+        # Deduplicate
+        ctx.textlines = _deduplicate_textlines(ctx.textlines, iou_threshold=0.5)
+
+        # Save all detected textlines before OCR filtering (used later to ensure mask coverage)
+        ctx.textlines_all_detected = list(ctx.textlines)
+
+        # OCR
+        await self._report_progress('ocr')
+        try:
+            ctx.textlines = await self._run_ocr(config, ctx)
+        except Exception:
+            logger.error(f"Stage1 OCR error:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.textlines = []
+
+        if not ctx.textlines:
+            ctx.result = ctx.upscaled
+            return {'job_id': None, 'texts': [], 'from_lang': 'unknown'}
+
+        # Textline merge
+        await self._report_progress('textline_merge')
+        try:
+            ctx.text_regions = await self._run_textline_merge(config, ctx)
+        except Exception:
+            logger.error(f"Stage1 textline_merge error:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.text_regions = []
+
+        if not ctx.text_regions:
+            ctx.result = ctx.upscaled
+            return {'job_id': None, 'texts': [], 'from_lang': 'unknown'}
+
+        # Pre-dictionary
+        pre_dict = load_dictionary(self.pre_dict)
+        for region in ctx.text_regions:
+            region.text = apply_dictionary(region.text, pre_dict)
+
+        # Detect source language
+        texts = [region.text for region in ctx.text_regions]
+        try:
+            from_lang = langid.classify(' '.join(texts))[0].upper()
+        except Exception:
+            from_lang = 'unknown'
+        ctx.from_lang = from_lang
+
+        # Store context and return
+        job_id = str(_uuid.uuid4())
+        self._pending_contexts[job_id] = ctx
+        return {'job_id': job_id, 'texts': texts, 'from_lang': from_lang}
+
+    async def translate_stage2(self, job_id: str, translated_texts: list, config: Config) -> Context:
+        """Two-stage pipeline Stage 2: apply translations + mask_refinement + inpainting + rendering."""
+        ctx = self._pending_contexts.pop(job_id, None)
+        if ctx is None:
+            raise ValueError(f'No pending context for job_id={job_id}')
+
+        # Apply translations to text regions
+        for region, translation in zip(ctx.text_regions, translated_texts):
+            if config.render.uppercase:
+                translation = translation.upper()
+            elif config.render.lowercase:
+                translation = translation.lower()
+            region.translation = translation
+            region.target_lang = config.translator.target_lang
+            region._alignment = config.render.alignment
+            region._direction = config.render.direction
+
+        # Filter regions with empty translations
+        ctx.text_regions = [r for r in ctx.text_regions if r.translation]
+        if not ctx.text_regions:
+            ctx.result = ctx.upscaled
+            return await self._revert_upscale(config, ctx)
+
+        # Mask refinement
+        if ctx.mask is None:
+            await self._report_progress('mask-generation')
+            try:
+                ctx.mask = await self._run_mask_refinement(config, ctx)
+            except Exception:
+                logger.error(f"Stage2 mask error:\n{traceback.format_exc()}")
+                if not self.ignore_errors:
+                    raise
+                ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros_like(ctx.img_rgb, dtype=np.uint8)[:, :, 0]
+
+        # Ensure all detected regions (including OCR-failed) are covered by the mask
+        self._apply_textlines_to_mask(config, ctx)
+
+        # Inpainting
+        await self._report_progress('inpainting')
+        try:
+            ctx.img_inpainted = await self._run_inpainting(config, ctx)
+        except Exception:
+            logger.error(f"Stage2 inpainting error:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.img_inpainted = ctx.img_rgb
+        ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
+
+        # Rendering
+        await self._report_progress('rendering')
+        try:
+            ctx.img_rendered = await self._run_text_rendering(config, ctx)
+        except Exception:
+            logger.error(f"Stage2 rendering error:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.img_rendered = ctx.img_inpainted
+
+        await self._report_progress('finished', True)
+        ctx.result = dump_image(ctx.input, ctx.img_rendered, ctx.img_alpha)
+        return await self._revert_upscale(config, ctx)
+
+    async def translate_stage1_batch(self, images: List['Image.Image'], config: Config) -> List[dict]:
+        """Run stage1 for multiple images sequentially on this worker (shared GPU model state)."""
+        results = []
+        for image in images:
+            try:
+                result = await self.translate_stage1(image, config)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Stage1 batch item error: {e}")
+                results.append({'job_id': None, 'texts': [], 'from_lang': 'unknown', 'error': str(e)})
+        return results
+
+    async def translate_stage2_batch(self, jobs: List[dict], config: Config) -> List[Context]:
+        """Stage2 for multiple jobs: mask refinement + batch GPU inpainting + per-image rendering."""
+        contexts = []
+        for job in jobs:
+            job_id = job['job_id']
+            ctx = self._pending_contexts.pop(job_id, None)
+            if ctx is None:
+                raise ValueError(f'No pending context for job_id={job_id}')
+            for region, translation in zip(ctx.text_regions, job['translated_texts']):
+                if config.render.uppercase:
+                    translation = translation.upper()
+                elif config.render.lowercase:
+                    translation = translation.lower()
+                region.translation = translation
+                region.target_lang = config.translator.target_lang
+                region._alignment = config.render.alignment
+                region._direction = config.render.direction
+            ctx.text_regions = [r for r in ctx.text_regions if r.translation]
+            contexts.append(ctx)
+
+        # Mask refinement per image
+        for ctx in contexts:
+            if ctx.mask is None:
+                try:
+                    ctx.mask = await self._run_mask_refinement(config, ctx)
+                except Exception:
+                    ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros(ctx.img_rgb.shape[:2], dtype=np.uint8)
+            self._apply_textlines_to_mask(config, ctx)
+
+        # Batch GPU inpainting
+        imgs = [ctx.img_rgb for ctx in contexts]
+        msks = [ctx.mask for ctx in contexts]
+        try:
+            inpainted = await dispatch_inpainting_batch(
+                config.inpainter.inpainter, imgs, msks, config.inpainter,
+                config.inpainter.inpainting_size, self.device
+            )
+        except Exception:
+            logger.error(f"Batch inpainting error:\n{traceback.format_exc()}")
+            inpainted = [ctx.img_rgb for ctx in contexts]
+
+        # Rendering per image
+        result_contexts = []
+        for ctx, img_inpainted in zip(contexts, inpainted):
+            ctx.img_inpainted = img_inpainted
+            ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
+            try:
+                ctx.img_rendered = await self._run_text_rendering(config, ctx)
+            except Exception:
+                ctx.img_rendered = ctx.img_inpainted
+            ctx.result = dump_image(ctx.input, ctx.img_rendered, ctx.img_alpha)
+            ctx = await self._revert_upscale(config, ctx)
+            result_contexts.append(ctx)
+        return result_contexts
+
     async def _translate(self, config: Config, ctx: Context) -> Context:
         # Start the background cleanup job once if not already started.
         if self._detector_cleanup_task is None:
@@ -638,13 +875,16 @@ class MangaTranslator:
         before_count = len(ctx.textlines)
         ctx.textlines = _deduplicate_textlines(ctx.textlines, iou_threshold=0.5)
         after_count = len(ctx.textlines)
-        logger.info(f'[Detection] Textlines before dedup: {before_count}, after: {after_count} (removed {before_count - after_count})')
+        logger.debug(f'[Detection] Textlines before dedup: {before_count}, after: {after_count} (removed {before_count - after_count})')
 
         if self.verbose:
             img_bbox_raw = np.copy(ctx.img_rgb)
             for txtln in ctx.textlines:
                 cv2.polylines(img_bbox_raw, [txtln.pts], True, color=(255, 0, 0), thickness=2)
             cv2.imwrite(self._result_path('bboxes_unfiltered.png'), cv2.cvtColor(img_bbox_raw, cv2.COLOR_RGB2BGR))
+
+        # Save all detected textlines before OCR filtering (for mask coverage of OCR-failed regions)
+        ctx.textlines_all_detected = list(ctx.textlines)
 
         # -- OCR
         await self._report_progress('ocr')
@@ -732,6 +972,9 @@ class MangaTranslator:
                 if not self.ignore_errors:  
                     raise 
                 ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros_like(ctx.img_rgb, dtype=np.uint8)[:,:,0] # Fallback to raw mask or empty mask
+
+        # Ensure all detected regions (including OCR-failed) are covered by the mask
+        self._apply_textlines_to_mask(config, ctx)
 
         if self.verbose and ctx.mask is not None:
             inpaint_input_img = await dispatch_inpainting(Inpainter.none, ctx.img_rgb, ctx.mask, config.inpainter,config.inpainter.inpainting_size,
@@ -931,7 +1174,7 @@ class MangaTranslator:
                 self.device, False
             )
             added = sum(1 for tl in sec_tls if _add_unique(textlines, tl))
-            logger.info(f'[Detection] Secondary detector {sec_det}: {len(sec_tls)} találat, {added} új hozzáadva')
+            logger.debug(f'[Detection] Secondary detector {sec_det}: {len(sec_tls)} találat, {added} új hozzáadva')
 
         return textlines, raw_mask, mask
 
@@ -983,12 +1226,12 @@ class MangaTranslator:
             if not any(_box_iou(cand, kept) > 0.5 for kept in bubble_boxes):
                 bubble_boxes.append(cand)
 
-        logger.info(f'[Detection] Bubble detector: {len(bubble_boxes_raw)} régió → dedup után: {len(bubble_boxes)}')
+        logger.debug(f'[Detection] Bubble detector: {len(bubble_boxes_raw)} régió → dedup után: {len(bubble_boxes)}')
 
         # Step 2 – Primary + secondary detectors a teljes képen
         # _run_detection already merges secondary_detectors results via _add_unique
         ctd_textlines, raw_mask, mask = await self._run_detection(config, ctx)
-        logger.info(f'[Detection] Detektorok (teljes kép): {len(ctd_textlines)} régió (primary + {len(config.detector.secondary_detectors)} secondary)')
+        logger.debug(f'[Detection] Detektorok (teljes kép): {len(ctd_textlines)} régió (primary + {len(config.detector.secondary_detectors)} secondary)')
 
         # Rendeljük hozzá a CTD dobozokat a bubble régiókhoz
         bubble_ctd_map = {i: [] for i in range(len(bubble_boxes))}
@@ -1058,9 +1301,9 @@ class MangaTranslator:
                     if _add_unique(local_found, tl, iou_thresh=0.2) and _add_unique(textlines, tl, iou_thresh=0.2):
                         extra += 1
                 if extra:
-                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort + crop +{extra} kiegészítő')
+                    logger.debug(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort + crop +{extra} kiegészítő')
                 else:
-                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort talált')
+                    logger.debug(f'[Detection] Bubble régió {i+1} [{label_name}]: CTD {len(bubble_ctd_map[i])} sort talált')
             else:
                 # Detektorok nem találtak semmit a buborékban → próbáljuk a kivágaton
                 crop = ctx.img_rgb[by1:by2, bx1:bx2]
@@ -1072,14 +1315,14 @@ class MangaTranslator:
                     # miközben dobozuk belenyúlik, és hamisan elnyomná a crop eredményeket.
                     # A _deduplicate_textlines (detekció után) kezeli az igazi duplikátokat.
                     textlines.extend(crop_tls_combined)
-                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: crop {len(crop_tls_combined)} találat hozzáadva')
+                    logger.debug(f'[Detection] Bubble régió {i+1} [{label_name}]: crop {len(crop_tls_combined)} találat hozzáadva')
                 else:
                     # Fallback: a teljes bubble régiót adjuk hozzá
                     pts = np.array([[bx1, by1], [bx2, by1], [bx2, by2], [bx1, by2]], dtype=np.int32)
                     _add_unique(textlines, Quadrilateral(pts, '', 0.9))
-                    logger.info(f'[Detection] Bubble régió {i+1} [{label_name}]: fallback, teljes régió hozzáadva')
+                    logger.debug(f'[Detection] Bubble régió {i+1} [{label_name}]: fallback, teljes régió hozzáadva')
 
-        logger.info(f'[Detection] Végeredmény: {len(textlines)} régió')
+        logger.debug(f'[Detection] Végeredmény: {len(textlines)} régió')
         ctx.bubble_boxes = bubble_boxes
         return textlines, raw_mask, mask
 
@@ -1155,6 +1398,46 @@ class MangaTranslator:
         # -- Secondary OCR comparison (optional)
         if config.ocr.secondary_ocr and config.ocr.secondary_ocr != config.ocr.ocr:
             textlines = await self._run_secondary_ocr_and_merge(config, ctx, textlines)
+
+        # -- Tertiary OCR: fill-in for empty regions, then score-based override for all regions
+        if config.ocr.tertiary_ocr and config.ocr.tertiary_ocr.value != 'none' and config.ocr.tertiary_ocr != config.ocr.ocr:
+            # Pass 1: empty regions (fill-in)
+            empty_tls = [tl for tl in ctx.textlines if not tl.text.strip()]
+            if empty_tls:
+                logger.debug(f'[OCR] Tertiary({config.ocr.tertiary_ocr}): {len(empty_tls)} üres régiót próbálok meg beolvasni')
+                await dispatch_ocr(config.ocr.tertiary_ocr, ctx.img_rgb, empty_tls, config.ocr, self.device, False)
+                recovered = []
+                for tl in empty_tls:
+                    if tl.text.strip():
+                        logger.info(f'[OCR] Tertiary({config.ocr.tertiary_ocr}) recovered: {repr(tl.text)} (prob={tl.prob:.2f})')
+                        recovered.append(tl)
+                if recovered:
+                    textlines = list(textlines) + recovered
+
+            # Pass 2: score-based override on suspicious regions only.
+            # Manga OCR models are confident-but-wrong on colored-bg game UI fonts
+            # (e.g. CTC returns prob=1.0 for garbage like "THEEDHE OFTHEWORID").
+            # RapidOCR handles arbitrary fonts much better — keep whichever has a higher _ocr_score.
+            # Limited to uncertain (prob<0.6) or suspiciously high-confidence short reads (prob>0.88, len<50)
+            # to avoid slow CPU inference across the full page.
+            _MAX_PASS2 = 12
+            all_nonempty = [tl for tl in textlines if tl.text.strip()]
+            candidates = [
+                tl for tl in all_nonempty
+                if tl.prob < 0.6 or (tl.prob > 0.88 and len(tl.text.strip()) < 50)
+            ][:_MAX_PASS2]
+            if candidates:
+                logger.info(f'[OCR] Tertiary({config.ocr.tertiary_ocr}): {len(candidates)}/{len(all_nonempty)} gyanús régiót ellenőrzök score-alapú felülírással')
+                originals = {id(tl): (tl.text, tl.prob) for tl in candidates}
+                await dispatch_ocr(config.ocr.tertiary_ocr, ctx.img_rgb, candidates, config.ocr, self.device, False)
+                for tl in candidates:
+                    orig_text, orig_prob = originals[id(tl)]
+                    orig_score = self._ocr_score(orig_text, orig_prob)
+                    new_score = self._ocr_score(tl.text, tl.prob)
+                    if tl.text.strip() and new_score > orig_score:
+                        logger.info(f'[OCR] Tertiary override: {repr(orig_text)} (score={orig_score:.1f}) → {repr(tl.text)} (score={new_score:.1f})')
+                    else:
+                        tl.text, tl.prob = orig_text, orig_prob
 
         new_textlines = []
         for textline in textlines:
@@ -1842,6 +2125,34 @@ class MangaTranslator:
 
         return new_text_regions
 
+    def _apply_textlines_to_mask(self, config: 'Config', ctx: Context) -> None:
+        """Paint translated text regions onto the mask (only where translation exists)."""
+        from .config import MaskFillMode
+        if ctx.mask is None or not ctx.text_regions:
+            return
+        mode = config.mask_fill_mode
+        for region in ctx.text_regions:
+            try:
+                x1, y1, x2, y2 = (int(v) for v in region.xyxy)
+                if mode == MaskFillMode.none:
+                    pass
+                elif mode == MaskFillMode.character:
+                    roi = ctx.img_rgb[y1:y2, x1:x2]
+                    if roi.size == 0:
+                        continue
+                    roi_gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
+                    fg = region.fg_colors
+                    fg_lum = 0.2126 * fg[0] + 0.7152 * fg[1] + 0.0722 * fg[2]
+                    text_px = (roi_gray < 128).astype(np.uint8) * 255 if fg_lum < 128 \
+                              else (roi_gray > 128).astype(np.uint8) * 255
+                    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                    text_px = cv2.dilate(text_px, kern)
+                    ctx.mask[y1:y2, x1:x2] = np.maximum(ctx.mask[y1:y2, x1:x2], text_px)
+                else:  # bbox (default)
+                    cv2.rectangle(ctx.mask, (x1, y1), (x2, y2), 255, -1)
+            except Exception:
+                pass
+
     async def _run_mask_refinement(self, config: Config, ctx: Context):
         return await dispatch_mask_refinement(ctx.text_regions, ctx.img_rgb, ctx.mask_raw, 'fit_text',
                                               config.mask_dilation_offset, config.ocr.ignore_bubble, self.verbose,self.kernel_size)
@@ -1863,12 +2174,13 @@ class MangaTranslator:
             if config.render.renderer == Renderer.manga2EngPillow:
                 output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing)
             else:
-                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing)
+                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing, font_size_maximum=config.render.max_font_size)
         else:
             _font = config.render.font_path or self.font_path
             output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, _font, config.render.font_size,
                                               config.render.font_size_offset,
-                                              config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing)
+                                              config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing,
+                                              font_size_maximum=config.render.max_font_size)
         return output
 
     def _result_path(self, path: str) -> str:
@@ -2244,14 +2556,17 @@ class MangaTranslator:
                 cv2.polylines(img_bbox_raw, [txtln.pts], True, color=(255, 0, 0), thickness=2)
             cv2.imwrite(self._result_path('bboxes_unfiltered.png'), cv2.cvtColor(img_bbox_raw, cv2.COLOR_RGB2BGR))
 
+        # Save all detected textlines before OCR filtering (for mask coverage of OCR-failed regions)
+        ctx.textlines_all_detected = list(ctx.textlines)
+
         # -- OCR
         await self._report_progress('ocr')
         try:
             ctx.textlines = await self._run_ocr(config, ctx)
-        except Exception as e:  
-            logger.error(f"Error during ocr:\n{traceback.format_exc()}")  
-            if not self.ignore_errors:  
-                raise 
+        except Exception as e:
+            logger.error(f"Error during ocr:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
             ctx.textlines = []
 
         if not ctx.textlines:
@@ -2263,10 +2578,10 @@ class MangaTranslator:
         await self._report_progress('textline_merge')
         try:
             ctx.text_regions = await self._run_textline_merge(config, ctx)
-        except Exception as e:  
-            logger.error(f"Error during textline_merge:\n{traceback.format_exc()}")  
-            if not self.ignore_errors:  
-                raise 
+        except Exception as e:
+            logger.error(f"Error during textline_merge:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
             ctx.text_regions = []
 
         if self.verbose and ctx.text_regions:
@@ -3000,11 +3315,14 @@ class MangaTranslator:
                     raise 
                 ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros_like(ctx.img_rgb, dtype=np.uint8)[:,:,0]
 
+        # Ensure all detected regions (including OCR-failed) are covered by the mask
+        self._apply_textlines_to_mask(config, ctx)
+
         if self.verbose and ctx.mask is not None:
             try:
                 inpaint_input_img = await dispatch_inpainting(Inpainter.none, ctx.img_rgb, ctx.mask, config.inpainter,config.inpainter.inpainting_size,
                                                               self.device, self.verbose)
-                
+
                 # 保存inpaint_input.png
                 inpaint_input_path = self._result_path('inpaint_input.png')
                 success1 = cv2.imwrite(inpaint_input_path, cv2.cvtColor(inpaint_input_img, cv2.COLOR_RGB2BGR))

@@ -37,14 +37,14 @@ class ComicBubbleHFDetector(InfererModule):
                 'Install it with: pip install "transformers>=4.49.0"'
             )
 
-        self.logger.info(f'Loading comic bubble detector from {MODEL_REPO} ...')
+        self.logger.debug(f'Loading comic bubble detector from {MODEL_REPO} ...')
         self.processor = RTDetrImageProcessor.from_pretrained(MODEL_REPO)
         self.model = RTDetrV2ForObjectDetection.from_pretrained(MODEL_REPO)
         self.model.eval()
         self.device = device
         if device in ('cuda', 'mps'):
             self.model = self.model.to(device)
-        self.logger.info(f'Comic bubble detector loaded on {device}')
+        self.logger.debug(f'Comic bubble detector loaded on {device}')
 
     def detect_regions(self, image: np.ndarray, confidence: float = 0.3):
         """

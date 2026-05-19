@@ -216,6 +216,8 @@ FONT_SELECTION: List[freetype.Face] = []
 font_cache = {}
 def get_cached_font(path: str) -> freetype.Face:
     path = path.replace('\\', '/')
+    if not os.path.isabs(path):
+        path = str(Path(BASE_PATH) / path)
     if not font_cache.get(path):
         # To circumvent a bug with non ascii paths in windows use memory fonts
         # https://github.com/rougier/freetype-py/issues/157#issuecomment-1683713726

@@ -178,16 +178,25 @@ def complete_mask(img: np.ndarray, mask: np.ndarray, textlines: List[Quadrilater
         cc_region = np.ascontiguousarray(cc[y1: y1 + h1, x1: x1 + w1])
         if cc_region.size == 0:
             continue
-        # cv2.imshow('cc before', image_resize(cc_region, height = 800))
         img_region = np.ascontiguousarray(img[y1: y1 + h1, x1: x1 + w1])
-        # cv2.imshow('img', image_resize(img_region, height = 800))
         cc_region = refine_mask(img_region, cc_region)
-        # cv2.imshow('cc after', image_resize(cc_region, height = 800))
-        # cv2.waitKey(0)
         cc[y1: y1 + h1, x1: x1 + w1] = cc_region
-        # cc = cv2.dilate(cc, kern)
-        x2, y2, w2, h2 = extend_rect(x1, y1, w1, h1, img.shape[1], img.shape[0], -(-dilate_size // 2))
-        cc[y2:y2+h2, x2:x2+w2] = cv2.dilate(cc[y2:y2+h2, x2:x2+w2], kern)
+
+        # If the background behind this text is complex (face, art, screentone),
+        # use minimal dilation to avoid erasing surrounding details.
+        bg_pixels = img_region[cc_region == 0]
+        if bg_pixels.size > 0:
+            bg_std = float(np.std(bg_pixels.astype(np.float32)))
+            if bg_std > 30:
+                effective_dilate = 3
+            else:
+                effective_dilate = dilate_size
+        else:
+            effective_dilate = dilate_size
+        eff_kern = kern if effective_dilate == dilate_size else cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (effective_dilate, effective_dilate))
+
+        x2, y2, w2, h2 = extend_rect(x1, y1, w1, h1, img.shape[1], img.shape[0], -(-effective_dilate // 2))
+        cc[y2:y2+h2, x2:x2+w2] = cv2.dilate(cc[y2:y2+h2, x2:x2+w2], eff_kern)
         final_mask[y2:y2+h2, x2:x2+w2] = cv2.bitwise_or(final_mask[y2:y2+h2, x2:x2+w2], cc[y2:y2+h2, x2:x2+w2])
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     # for (x, y, w, h) in text_lines:

@@ -30,20 +30,21 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
     _TIMEOUT_RETRY_ATTEMPTS = 1  # 请求因超时被取消后，最大尝试次数
     _RATELIMIT_RETRY_ATTEMPTS = 1# 遇到 429 等限流时的最大尝试次数
     _MAX_SPLIT_ATTEMPTS = 1      # 递归拆分批次的最大层数
-    _MAX_TOKENS = 8000           # prompt+completion 的最大 token (可按模型类型调整)
+    _MAX_TOKENS = 8000
 
-    def __init__(self, check_openai_key=True):
+    def __init__(self, check_openai_key=True, api_key=None):
         # ConfigGPT 的初始化
         _CONFIG_KEY = 'chatgpt.' + OPENAI_MODEL
         ConfigGPT.__init__(self, config_key=_CONFIG_KEY)
         CommonTranslator.__init__(self)
 
-        if not OPENAI_API_KEY and check_openai_key:
+        key = api_key or OPENAI_API_KEY
+        if not key and check_openai_key:
             raise MissingAPIKeyException('OPENAI_API_KEY environment variable required')
 
         # 根据代理与基础URL等参数实例化 openai.AsyncOpenAI 客户端
         client_args = {
-            "api_key": OPENAI_API_KEY,
+            "api_key": key,
             "base_url": OPENAI_API_BASE
         }
         if OPENAI_HTTP_PROXY:
@@ -80,6 +81,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         self.prev_context = ""
         # 可选的回退模型（通过环境变量 OPENAI_FALLBACK_MODEL 指定）
         self._fallback_model = None
+        self._config_model = None
 
     def set_prev_context(self, text: str = ""):
         self.prev_context = text or ""     
@@ -87,6 +89,9 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
     def parse_args(self, args: CommonTranslator):
         """如果你有外部参数要解析，可在此对 self.config 做更新"""
         self.config = args.chatgpt_config
+        if hasattr(args, 'model') and args.model:
+            self._config_model = args.model
+            self.logger.info(f"Model override from config: {args.model}")
 
     async def _ratelimit_sleep(self):
         """
@@ -631,7 +636,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 # 等待请求
                 return await asyncio.wait_for(
                     self._request_translation(to_lang, prompt),
-                    timeout=self._TIMEOUT
+                    timeout=self.request_timeout
                 )        # 超时 => 取消请求并重试
             except asyncio.TimeoutError:
                 timeout_attempt += 1
@@ -650,7 +655,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 server_error_attempt += 1
                 if server_error_attempt > self._RETRY_ATTEMPTS:
                     raise
-                self.logger.warning(f"API error, retrying... ({server_error_attempt})")
+                self.logger.warning(f"API error, retrying... ({server_error_attempt}) [{type(e).__name__}] {e}")
                 await asyncio.sleep(1)
 
             except Exception as e:
@@ -688,10 +693,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 "Keep the <|number|> prefix exactly as given.\n"
                 "Do not merge lines.\n"
                 "Do not add explanations.\n"
-                f"Translate EVERY segment into {lang_name} — including segments that appear to already be in English or another language. Full sentences and dialogue must always be translated.\n"
-                "Fordíts természetes, folyékony magyar nyelvre, ne szó szerint.\n"
-                "Használj hétköznapi, beszélt magyar stílust.\n"
-                "Ha a szó szerinti fordítás furcsán hangzik, fogalmazd át.\n"
+                f"Translate EVERY segment into {lang_name}..."
                 + manga_ctx_block
             },
         ]  
@@ -741,25 +743,52 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         
 
         # 发起请求 / Initiate the request
-        response = await self.client.responses.create(
-            model= self._fallback_model or OPENAI_MODEL,
-            input=messages,
-            max_output_tokens=self._MAX_TOKENS // 2,
-            reasoning={"effort": "low"},   # 🔥 kritikus
-            
-            top_p=self.top_p,
-            timeout=self._TIMEOUT
-        )
-        raw_text = ""
-        if hasattr(response, "output_text") and response.output_text:
-            raw_text = response.output_text
-            
-        else:
-            try:
-                raw_text = response.output[0].content[0].text
-            except Exception:
+        _api_start = time.time()
+        if self.use_chat_completions:
+            response = await self.client.chat.completions.create(
+                model=self._fallback_model or self._config_model or OPENAI_MODEL,
+                messages=messages,
+                max_completion_tokens=self.max_output_tokens,
+                timeout=self.request_timeout
+            )
+            _api_elapsed = time.time() - _api_start
+            usage = getattr(response, 'usage', None)
+            if usage:
+                reasoning_tokens = getattr(getattr(usage, 'completion_tokens_details', None), 'reasoning_tokens', 0)
+                text_tokens = (usage.completion_tokens or 0) - reasoning_tokens
+                self.logger.info(f"[GPT] {_api_elapsed:.1f}s | prompt={usage.prompt_tokens} reasoning={reasoning_tokens} output={text_tokens} total={usage.total_tokens}")
+                if reasoning_tokens >= self.max_output_tokens - 50:
+                    self.logger.warning(f"[GPT] Reasoning tokens ({reasoning_tokens}) consumed nearly all budget ({self.max_output_tokens}). Increase max_output_tokens in YAML.")
+            else:
+                self.logger.info(f"[GPT] {_api_elapsed:.1f}s (no usage info)")
+            raw_text = response.choices[0].message.content or ""
+            if not raw_text:
                 self.logger.error(f"FULL RESPONSE: {response}")
                 raise ValueError("Empty response from OpenAI API")
+        else:
+            response = await self.client.responses.create(
+                model=self._fallback_model or self._config_model or OPENAI_MODEL,
+                input=messages,
+                max_output_tokens=self.max_output_tokens,
+                reasoning={"effort": self.reasoning_effort},
+                top_p=self.top_p,
+                timeout=self.request_timeout
+            )
+            _api_elapsed = time.time() - _api_start
+            usage = getattr(response, 'usage', None)
+            if usage:
+                reasoning_tokens = getattr(getattr(usage, 'output_tokens_details', None), 'reasoning_tokens', 0)
+                text_tokens = (getattr(usage, 'output_tokens', 0) or 0) - reasoning_tokens
+                self.logger.info(f"[GPT] {_api_elapsed:.1f}s | prompt={getattr(usage, 'input_tokens', '?')} reasoning={reasoning_tokens} output={text_tokens} total={getattr(usage, 'total_tokens', '?')}")
+            raw_text = ""
+            if hasattr(response, "output_text") and response.output_text:
+                raw_text = response.output_text
+            else:
+                try:
+                    raw_text = response.output[0].content[0].text
+                except Exception:
+                    self.logger.error(f"FULL RESPONSE: {response}")
+                    raise ValueError("Empty response from OpenAI API")
 
     
         
@@ -770,8 +799,10 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
         # Remove <think>...</think> tags and their contents. Since the reasoning process of some relay API models is forcibly output and not included in the reasoning_content, additional filtering is required.
         raw_text = re.sub(r'(</think>)?<think>.*?</think>', '', raw_text, flags=re.DOTALL)
 
+        # Ha a modell egy sorba írta az összes fordítást (<|1|>...<|2|>...), sortörést szúrunk be
+        raw_text = re.sub(r'(?<!\n)(<\|\d+\|>)', r'\n\1', raw_text)
+
         # 删除多余的空行 / Remove extra blank lines
-        
         cleaned_text = re.sub(r'\n\s*\n', '\n', raw_text).strip()
 
         # 删除数字前缀前后的不相关的解释性文字。但不出现数字前缀时，保留限制词防止删得什么都不剩
@@ -808,23 +839,22 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
 
             cleaned_text = "\n".join(modified_lines)      
         
-        # 记录 token 消耗 / Record token consumption
-        if not hasattr(response, 'usage') or not hasattr(response.usage, 'total_tokens'):
-            self.logger.warning("Response does not contain usage information") #第三方逆向中转api不返回token数 / The third-party reverse proxy API does not return token counts
-            self.token_count_last = 0
-            
-        # 记录 token 消耗   (rich模式) / Record token consumption (rich mode)
-        # if not hasattr(response, 'usage') or not hasattr(response.usage, 'total_tokens'):  
-            # warning_text = "WARNING: [OpenAITranslator] Response does not contain usage information"  
-            # self.print_boxed(warning_text, border_color="yellow")  
-            # self.token_count_last = 0              
-            
+        _elapsed = time.time() - _api_start
+        usage = getattr(response, 'usage', None)
+        if usage:
+            _ct = getattr(usage, 'completion_tokens', None) or getattr(usage, 'output_tokens', 0) or 0
+            _pt = getattr(usage, 'prompt_tokens', None) or getattr(usage, 'input_tokens', 0) or 0
+            _rt = getattr(getattr(usage, 'completion_tokens_details', None), 'reasoning_tokens', None) \
+                  or getattr(getattr(usage, 'output_tokens_details', None), 'reasoning_tokens', 0) or 0
+            _ot = _ct - _rt
+            _total = getattr(usage, 'total_tokens', _ct + _pt)
+            self.token_count += _total
+            self.token_count_last = _total
+            _title = f"GPT Response | {_elapsed:.1f}s | in={_pt} reason={_rt} out={_ot}"
         else:
-            self.token_count += response.usage.total_tokens
-            self.token_count_last = response.usage.total_tokens
-        
-        response_text = cleaned_text
-        self.print_boxed(response_text, border_color="green", title="GPT Response")          
+            self.token_count_last = 0
+            _title = f"GPT Response | {_elapsed:.1f}s"
+        self.print_boxed(cleaned_text, border_color="green", title=_title)
         return cleaned_text
 
     def _fix_prefix_spacing(self, text_to_fix):

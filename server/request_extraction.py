@@ -3,6 +3,7 @@ import builtins
 import io
 import re
 from base64 import b64decode
+from pathlib import Path
 from typing import Union
 
 import requests
@@ -15,18 +16,41 @@ from manga_translator import Config
 from server.myqueue import task_queue, wait_in_queue, QueueElement, BatchQueueElement
 from server.streaming import notify, stream
 
+
+def _load_default_config() -> Config:
+    config_path = Path(__file__).parent.parent / 'config' / 'gpt_web.json'
+    if config_path.exists():
+        try:
+            return Config.parse_raw(config_path.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+    return Config()
+
+_DEFAULT_CONFIG = _load_default_config()
+
+
+def parse_config_or_default(config_str: str) -> Config:
+    """Return gpt.json defaults when config is empty/trivial, otherwise parse the given JSON."""
+    if config_str.strip() in ('{}', '', 'null'):
+        return _DEFAULT_CONFIG
+    try:
+        return Config.parse_raw(config_str)
+    except Exception:
+        return _DEFAULT_CONFIG
+
+
 class TranslateRequest(BaseModel):
     """This request can be a multipart or a json request"""
     image: bytes|str
     """can be a url, base64 encoded image or a multipart image"""
-    config: Config = Config()
+    config: Config = _DEFAULT_CONFIG
     """in case it is a multipart this needs to be a string(json.stringify)"""
 
 class BatchTranslateRequest(BaseModel):
     """Batch translation request"""
     images: list[bytes|str]
     """List of images, can be URLs, base64 encoded strings, or binary data"""
-    config: Config = Config()
+    config: Config = _DEFAULT_CONFIG
     """Translation configuration"""
     batch_size: int = 4
     """Batch size, default is 4"""

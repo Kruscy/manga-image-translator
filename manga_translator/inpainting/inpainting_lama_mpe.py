@@ -118,6 +118,81 @@ class LamaMPEInpainter(OfflineInpainter):
         return ans
     
 
+    async def _infer_batch(self, images: list, masks: list, config: InpainterConfig, inpainting_size: int = 1024) -> list:
+        """Batch inpainting: N images in one GPU forward pass."""
+        if len(images) == 1:
+            return [await self._infer(images[0], masks[0], config, inpainting_size)]
+
+        processed = []
+        for img_in, mask_in in zip(images, masks):
+            img = np.copy(img_in)
+            mask = np.copy(mask_in)
+            orig_img = np.copy(img)
+            mask_orig = np.copy(mask)
+            mask_orig[mask_orig < 127] = 0
+            mask_orig[mask_orig >= 127] = 1
+            mask_orig = mask_orig[:, :, None]
+            orig_h, orig_w = img.shape[:2]
+            if max(img.shape[:2]) > inpainting_size:
+                img = resize_keep_aspect(img, inpainting_size)
+                mask = resize_keep_aspect(mask, inpainting_size)
+            h, w = img.shape[:2]
+            new_h = h + (8 - h % 8) % 8
+            new_w = w + (8 - w % 8) % 8
+            if new_h != h or new_w != w:
+                img = cv2.resize(img, (new_w, new_h), cv2.INTER_LINEAR)
+                mask = cv2.resize(mask, (new_w, new_h), cv2.INTER_LINEAR)
+            processed.append(dict(img=img, mask=mask, orig_img=orig_img, mask_orig=mask_orig,
+                                   orig_h=orig_h, orig_w=orig_w, proc_h=new_h, proc_w=new_w))
+
+        max_h = max(p['proc_h'] for p in processed)
+        max_w = max(p['proc_w'] for p in processed)
+        self.logger.info(f'Batch inpainting {len(images)} images at {max_w}x{max_h}')
+
+        img_tensors, mask_tensors = [], []
+        for p in processed:
+            ph, pw = p['proc_h'], p['proc_w']
+            pad_h, pad_w = max_h - ph, max_w - pw
+            img_p = cv2.copyMakeBorder(p['img'], 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT) if (pad_h or pad_w) else p['img']
+            mask_p = cv2.copyMakeBorder(p['mask'], 0, pad_h, 0, pad_w, cv2.BORDER_REFLECT) if (pad_h or pad_w) else p['mask']
+            if isinstance(self.model, LamaFourier):
+                it = torch.from_numpy(img_p).permute(2, 0, 1).float() / 255.
+            else:
+                it = torch.from_numpy(img_p).permute(2, 0, 1).float() / 127.5 - 1.0
+            mt = (torch.from_numpy(mask_p).unsqueeze(0).float() / 255.0 >= 0.5).float()
+            img_tensors.append(it)
+            mask_tensors.append(mt)
+
+        img_t = torch.stack(img_tensors)
+        mask_t = torch.stack(mask_tensors)
+        if self.device.startswith('cuda') or self.device == 'mps':
+            img_t, mask_t = img_t.to(self.device), mask_t.to(self.device)
+
+        with torch.no_grad():
+            img_t = img_t * (1 - mask_t)
+            if not self.device.startswith('cuda'):
+                out_t = self.model(img_t, mask_t)
+            else:
+                precision = TORCH_DTYPE_MAP[str(config.inpainting_precision)]
+                if precision == torch.float16:
+                    precision = torch.bfloat16
+                with torch.autocast(device_type='cuda', dtype=precision):
+                    out_t = self.model(img_t, mask_t)
+
+        out_t = out_t.to(torch.float32).cpu()
+        results = []
+        for i, p in enumerate(processed):
+            if isinstance(self.model, LamaFourier):
+                out = (out_t[i].permute(1, 2, 0).numpy() * 255.).astype(np.uint8)
+            else:
+                out = ((out_t[i].permute(1, 2, 0).numpy() + 1.0) * 127.5).astype(np.uint8)
+            out = out[:p['proc_h'], :p['proc_w']]
+            if out.shape[:2] != (p['orig_h'], p['orig_w']):
+                out = cv2.resize(out, (p['orig_w'], p['orig_h']), cv2.INTER_LINEAR)
+            results.append(out * p['mask_orig'] + p['orig_img'] * (1 - p['mask_orig']))
+        return results
+
+
 class LamaLargeInpainter(LamaMPEInpainter):
 
     _MODEL_MAPPING = {

@@ -45,44 +45,50 @@ def count_text_length(text: str) -> float:
             length += 1.0
     return length
 
-def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock'], font_size_fixed: int, font_size_offset: int, font_size_minimum: int):  
+def resize_regions_to_font_size(img: np.ndarray, text_regions: List['TextBlock'], font_size_fixed: int, font_size_offset: int, font_size_minimum: int, font_size_maximum: int = None):
     """
     Adjust text region size to accommodate font size and translated text length.
-    
-    Args:  
+
+    Args:
         img: Input image
         text_regions: List of text regions to process
         font_size_fixed: Fixed font size (overrides other font parameters)
         font_size_offset: Font size offset
         font_size_minimum: Minimum font size (-1 for auto-calculation)
+        font_size_maximum: Maximum font size cap (None = no cap)
 
-    Returns:  
+    Returns:
         List of adjusted text region bounding boxes
-    """    
-    
-    # Define minimum font size
-    if font_size_minimum == -1:  
-        font_size_minimum = round((img.shape[0] + img.shape[1]) / 200)  
-    # logger.debug(f'font_size_minimum {font_size_minimum}')  
-    font_size_minimum = max(1, font_size_minimum)  
+    """
 
-    dst_points_list = []  
-    for region in text_regions: 
-    
+    # Define minimum font size
+    if font_size_minimum == -1:
+        font_size_minimum = round((img.shape[0] + img.shape[1]) / 200)
+    # logger.debug(f'font_size_minimum {font_size_minimum}')
+    font_size_minimum = max(1, font_size_minimum)
+
+    dst_points_list = []
+    for region in text_regions:
+
         # Store and validate original font size
-        original_region_font_size = region.font_size  
-        if original_region_font_size <= 0:  
-            # logger.warning(f"Invalid original font size ({original_region_font_size}) for text '{region.translation}'. Using default value {font_size_minimum}.")  
+        original_region_font_size = region.font_size
+        if original_region_font_size <= 0:
+            # logger.warning(f"Invalid original font size ({original_region_font_size}) for text '{region.translation}'. Using default value {font_size_minimum}.")
             original_region_font_size = font_size_minimum
+        # Cap oversized font sizes (e.g. from large fallback bounding boxes)
+        if font_size_maximum is not None and original_region_font_size > font_size_maximum:
+            original_region_font_size = font_size_maximum
 
         # Determine target font size
-        current_base_font_size = original_region_font_size  
-        if font_size_fixed is not None:  
-            target_font_size = font_size_fixed  
-        else:  
-            target_font_size = current_base_font_size + font_size_offset  
+        current_base_font_size = original_region_font_size
+        if font_size_fixed is not None:
+            target_font_size = font_size_fixed
+        else:
+            target_font_size = current_base_font_size + font_size_offset
 
-        target_font_size = max(target_font_size, font_size_minimum, 1)  
+        target_font_size = max(target_font_size, font_size_minimum, 1)
+        if font_size_maximum is not None:
+            target_font_size = min(target_font_size, font_size_maximum)  
         # print("-" * 50)
         # logger.debug(f"Calculated target font size: {target_font_size} for text '{region.translation}'")  
 
@@ -242,14 +248,15 @@ async def dispatch(
     hyphenate: bool = True,
     render_mask: np.ndarray = None,
     line_spacing: int = None,
-    disable_font_border: bool = False
+    disable_font_border: bool = False,
+    font_size_maximum: int = None,
     ) -> np.ndarray:
 
     text_render.set_font(font_path)
     text_regions = list(filter(lambda region: region.translation, text_regions))
 
     # Resize regions that are too small
-    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum)
+    dst_points_list = resize_regions_to_font_size(img, text_regions, font_size_fixed, font_size_offset, font_size_minimum, font_size_maximum)
 
     # TODO: Maybe remove intersections
 
@@ -411,13 +418,18 @@ def render(
     img[y:y+h, x:x+w] = np.clip((img[y:y+h, x:x+w].astype(np.float32) * (1 - mask_region) + canvas_region.astype(np.float32) * mask_region), 0, 255).astype(np.uint8)
     return img
 
-async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False) -> np.ndarray:
+async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False, font_size_maximum: int = None) -> np.ndarray:
     if len(text_regions) == 0:
         return img_canvas
 
     if not font_path:
         font_path = os.path.join(BASE_PATH, 'fonts/comic shanns 2.ttf')
     text_render.set_font(font_path)
+
+    if font_size_maximum is not None:
+        for region in text_regions:
+            if region.font_size > font_size_maximum:
+                region.font_size = font_size_maximum
 
     return render_textblock_list_eng(img_canvas, text_regions, line_spacing=line_spacing, size_tol=1.2, original_img=original_img, downscale_constraint=0.8,disable_font_border=disable_font_border)
 

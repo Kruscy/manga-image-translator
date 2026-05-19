@@ -128,7 +128,7 @@ class ModelWrapper(ABC):
         for map_key, mapping in self._MODEL_MAPPING.items():
             if 'url' not in mapping:
                 raise InvalidModelMappingException(self._key, map_key, 'Missing url property')
-            elif not re.search(r'^https?://', mapping['url']):
+            elif mapping['url'] and not re.search(r'^https?://', mapping['url']):
                 raise InvalidModelMappingException(self._key, map_key, 'Malformed url property: "%s"' % mapping['url'])
             if 'file' not in mapping and 'archive' not in mapping:
                 mapping['file'] = '.'

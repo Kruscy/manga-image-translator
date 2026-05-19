@@ -109,6 +109,8 @@ class Ocr(str, Enum):
     ocr48px_ctc = "48px_ctc"
     mocr = "mocr"
     torii = "torii"
+    rapidocr = "rapidocr"
+    none = "none"
 
 class Translator(str, Enum):
     youdao = "youdao"
@@ -155,6 +157,14 @@ class Upscaler(str, Enum):
     esrgan = "esrgan"
     upscler4xultrasharp = "4xultrasharp"
 
+class MaskFillMode(str, Enum):
+    character = "character"
+    """Threshold the original image within each text region to find ink pixels, then dilate. Precise and handles undetected lines."""
+    bbox = "bbox"
+    """Fill the full bounding rectangle of each text region. Covers gaps between detected lines."""
+    none = "none"
+    """No additional mask fill — rely solely on the detector output."""
+
 class RenderConfig(BaseModel):
     renderer: Renderer = Renderer.default
     font_path: Optional[str] = None
@@ -168,6 +178,8 @@ class RenderConfig(BaseModel):
     """Offset font size by a given amount, positive number increase font size and vice versa"""
     font_size_minimum: int = -1
     """Minimum output font size. Default is image_sides_sum/200"""
+    max_font_size: Optional[int] = None
+    """Maximum output font size. Prevents oversized text on large fallback regions."""
     direction: Direction = Direction.auto
     """Force text to be rendered horizontally/vertically/none"""
     uppercase: bool = False
@@ -229,6 +241,8 @@ class TranslatorConfig(BaseModel):
     """Dont skip text that is seemingly already in the target language."""
     skip_lang: Optional[str] = None
     """Skip translation if source image is one of the provide languages, use comma to separate multiple languages. Example: JPN,ENG"""
+    model: Optional[str] = None
+    """OpenAI model name to use (overrides OPENAI_MODEL env var). Example: gpt-4.1-nano"""
     gpt_config: Optional[str] = None  # todo: no more path
     """Path to GPT config file, more info in README"""
     translator_chain: Optional[str] = None
@@ -335,6 +349,8 @@ class OcrConfig(BaseModel):
     """Optical character recognition (OCR) model to use"""
     secondary_ocr: Optional[Ocr] = None
     """Optional second OCR model to run in parallel. Results are compared per region and the better one is kept. Useful for italic/unusual fonts where one model may only capture part of the text."""
+    tertiary_ocr: Optional[Ocr] = None
+    """Fallback OCR model that runs ONLY on regions where both primary and secondary returned empty text. Useful for game UI / scene text fonts that manga OCR models cannot read. Example: rapidocr"""
     min_text_length: int = 0
     """Minimum text length of a text region"""
     ignore_bubble: int = 0
@@ -367,6 +383,8 @@ class Config(BaseModel):
     """Set the convolution kernel size of the text erasure area to completely clean up text residues"""
     mask_dilation_offset: int = 20
     """By how much to extend the text mask to remove left-over text pixels of the original image."""
+    mask_fill_mode: MaskFillMode = MaskFillMode.bbox
+    """How to extend the mask for translated text regions: 'character' (ink-color threshold), 'bbox' (bounding rect), 'none' (detector output only)."""
     _filter_text = None
 
     @property
