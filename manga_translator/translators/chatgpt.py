@@ -771,7 +771,7 @@ class OpenAITranslator(ConfigGPT, CommonTranslator):
                 input=messages,
                 max_output_tokens=self.max_output_tokens,
                 reasoning={"effort": self.reasoning_effort},
-                top_p=self.top_p,
+                **({'top_p': self.top_p} if self.top_p is not None else {}),
                 timeout=self.request_timeout
             )
             _api_elapsed = time.time() - _api_start

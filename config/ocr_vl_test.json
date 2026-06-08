@@ -1,19 +1,19 @@
 {
   "detector": {
     "name": "ctd",
-	"detection_size": 2048,
-	"text_threshold": 0.5,
+    "detection_size": 2048,
+    "text_threshold": 0.5,
     "box_threshold": 0.75,
     "max_candidates": 70,
-	"unclip_ratio": 2.3,
+    "unclip_ratio": 2.3,
     "use_bubble_prefilter": true,
     "bubble_prefilter_confidence": 0.3
   },
   "ocr": {
-    "ocr": "48px_ctc",
-    "secondary_ocr": "48px",
-    "tertiary_ocr": "rapidocr",
-    "use_mocr_merge": true,
+    "ocr": "qwen_vl",
+    "secondary_ocr": "48px_ctc",
+    "tertiary_ocr": "none",
+    "use_mocr_merge": false,
     "ignore_bubble": 10,
     "min_text_length": 2
   },
@@ -24,7 +24,7 @@
     "lowercase": false,
     "no_hyphenation": true,
     "gimp_font": "WildWords",
-	"font_path": "./fonts/WildWords.ttf",
+    "font_path": "./fonts/WildWords.ttf",
     "auto_font_size": true,
     "font_size_offset": -2,
     "min_font_size": 12,
@@ -34,13 +34,13 @@
     "cute_font_path": null
   },
   "upscale": {
-  "upscaler": "esrgan"
+    "upscaler": "esrgan"
   },
   "inpainter": {
-  "inpainter": "lama_large",
-  "inpainting_size": 2048,
-  "inpainting_precision": "fp32"
-},
+    "inpainter": "lama_large",
+    "inpainting_size": 2048,
+    "inpainting_precision": "fp32"
+  },
   "translator": {
     "translator": "openai",
     "model": "gpt-5.4-mini",
@@ -48,8 +48,8 @@
     "target_lang": "HUN",
     "gpt_config": "./MangaStudio_Data/gpt_configs/local_hungarian.yaml"
   },
-   "kernel_size": 3,
-   "mask_dilation_offset": 3,
-   "mask_fill_mode": "character",
-   "models_dir": "./models"
+  "kernel_size": 3,
+  "mask_dilation_offset": 3,
+  "mask_fill_mode": "character",
+  "models_dir": "./models"
 }

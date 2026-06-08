@@ -12,7 +12,7 @@ def split_text_region(
         connected_region_indices: Set[int],
         width,
         height,
-        gamma = 0.5,
+        gamma = 0.3,
         sigma = 2
     ) -> List[Set[int]]:
 

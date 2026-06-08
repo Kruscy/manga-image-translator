@@ -110,6 +110,7 @@ class Ocr(str, Enum):
     mocr = "mocr"
     torii = "torii"
     rapidocr = "rapidocr"
+    qwen_vl = "qwen_vl"
     none = "none"
 
 class Translator(str, Enum):
@@ -180,6 +181,10 @@ class RenderConfig(BaseModel):
     """Minimum output font size. Default is image_sides_sum/200"""
     max_font_size: Optional[int] = None
     """Maximum output font size. Prevents oversized text on large fallback regions."""
+    horror_font_path: Optional[str] = None
+    """Font for dark-background (horror) speech bubbles. Auto-detected by bg brightness < 80."""
+    cute_font_path: Optional[str] = None
+    """Font for cute-style speech bubbles (optional, no auto-detection)."""
     direction: Direction = Direction.auto
     """Force text to be rendered horizontally/vertically/none"""
     uppercase: bool = False

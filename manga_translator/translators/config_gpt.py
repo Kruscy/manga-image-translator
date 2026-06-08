@@ -366,8 +366,8 @@ class ConfigGPT:
         return self._config_get('temperature', default=0.5)
 
     @property
-    def top_p(self) -> float:
-        return self._config_get('top_p', default=1)
+    def top_p(self):
+        return self._config_get('top_p', default=None)
 
     @property
     def max_output_tokens(self) -> int:

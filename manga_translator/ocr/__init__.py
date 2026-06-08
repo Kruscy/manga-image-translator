@@ -7,6 +7,7 @@ from .model_48px_ctc import Model48pxCTCOCR
 from .model_manga_ocr import ModelMangaOCR
 from .model_torii import ToriiOCR
 from .model_rapidocr import RapidOCRModel
+from .model_qwen_vl import QwenVLOCR
 from ..config import Ocr, OcrConfig
 from ..utils import Quadrilateral
 
@@ -17,6 +18,7 @@ OCRS = {
     Ocr.mocr: ModelMangaOCR,
     Ocr.torii: ToriiOCR,
     Ocr.rapidocr: RapidOCRModel,
+    Ocr.qwen_vl: QwenVLOCR,
 }
 ocr_cache = {}
 

@@ -239,8 +239,8 @@ class CommonGPTTranslator(ConfigGPT, CommonTranslator):
             "messages": messages,
             "max_tokens": self._MAX_TOKENS // 2,
             "temperature": self.temperature,
-            "top_p": self.top_p,
-            "timeout": self._TIMEOUT
+            "timeout": self._TIMEOUT,
+            **({'top_p': self.top_p} if self.top_p is not None else {}),
         }
 
         return kwargs
@@ -387,8 +387,8 @@ class _CommonGPTTranslator_JSON:
             "messages": messages,
             "max_tokens": self.translator._MAX_TOKENS,
             "temperature": self.translator.temperature,
-            "top_p": self.translator.top_p,
             "timeout": self.translator._TIMEOUT,
+            **({'top_p': self.translator.top_p} if self.translator.top_p is not None else {}),
             "response_format": TranslationList
         }
 

@@ -3,7 +3,7 @@ import numpy as np
 from PIL import Image
 from typing import List, Tuple
 
-from .text_render import get_char_glyph, put_char_horizontal, add_color
+from .text_render import get_char_glyph, put_char_horizontal, add_color, set_font
 from .ballon_extractor import extract_ballon_region
 from ..utils import TextBlock, rect_distance
 
@@ -416,6 +416,9 @@ def render_textblock_list_eng(
                 # print('>->', region2.translation, region2.enlarged_xyxy, region2.enlarge_ratio)
 
     for region in text_regions:
+        if getattr(region, '_eng_font_path', None):
+            set_font(region._eng_font_path)
+
         words = seg_eng(region.translation)
         if not words:
             continue

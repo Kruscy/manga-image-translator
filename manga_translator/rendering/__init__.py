@@ -418,13 +418,27 @@ def render(
     img[y:y+h, x:x+w] = np.clip((img[y:y+h, x:x+w].astype(np.float32) * (1 - mask_region) + canvas_region.astype(np.float32) * mask_region), 0, 255).astype(np.uint8)
     return img
 
-async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False, font_size_maximum: int = None) -> np.ndarray:
+async def dispatch_eng_render(img_canvas: np.ndarray, original_img: np.ndarray, text_regions: List[TextBlock], font_path: str = '', line_spacing: int = 0, disable_font_border: bool = False, font_size_maximum: int = None, horror_font_path: str = None, cute_font_path: str = None) -> np.ndarray:
     if len(text_regions) == 0:
         return img_canvas
 
     if not font_path:
         font_path = os.path.join(BASE_PATH, 'fonts/comic shanns 2.ttf')
     text_render.set_font(font_path)
+
+    h_img, w_img = img_canvas.shape[:2]
+    for region in text_regions:
+        if horror_font_path:
+            x1, y1, x2, y2 = [int(v) for v in region.xyxy]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w_img, x2), min(h_img, y2)
+            crop = img_canvas[y1:y2, x1:x2]
+            canvas_brightness = float(np.mean(crop)) if crop.size > 0 else 128.0
+            fg_brightness = float(np.mean(np.array(region.fg_colors, dtype=np.float32)))
+            is_horror = canvas_brightness < 80 or fg_brightness > 160
+            region._eng_font_path = horror_font_path if is_horror else font_path
+        else:
+            region._eng_font_path = font_path
 
     if font_size_maximum is not None:
         for region in text_regions:

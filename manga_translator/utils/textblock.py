@@ -78,15 +78,42 @@ class TextBlock(object):
         self._direction = direction
 
         self.texts = texts if texts is not None else []
-        self.text = texts[0]
-        if self.text and len(texts) > 1:
-            for txt in texts[1:]:
+        self.text = texts[0] if texts else ''
+
+        if texts and len(texts) > 1:
+            # Deduplicate: if text A is a (case-insensitive) substring of text B, drop A and keep B.
+            deduped = []
+            for t in texts:
+                tn = t.strip().lower() if t else ''
+                if tn and any(tn in (e.strip().lower() if e else '') for e in deduped if e):
+                    continue  # t is covered by or equal to something already in deduped \u2192 skip
+                if tn:
+                    deduped = [e for e in deduped if not (e and e.strip().lower() in tn and e.strip().lower() != tn)]
+                deduped.append(t)
+            texts_join = deduped if deduped else texts[:1]
+            self.texts = texts_join
+
+            self.text = texts_join[0] if texts_join else ''
+            for txt in texts_join[1:]:
+                if not txt or not self.text:
+                    if txt and not self.text:
+                        self.text = txt
+                    continue
                 first_cjk = '\u3000' <= self.text[-1] <= '\u9fff'
-                second_cjk = txt and ('\u3000' <= txt[0] <= '\u9fff')
+                second_cjk = '\u3000' <= txt[0] <= '\u9fff'
+                if not (first_cjk or second_cjk):
+                    # Trim suffix-prefix overlap: if the end of accumulated text matches
+                    # the beginning of txt (\u22658 chars), remove the repeated part from txt.
+                    max_ov = min(len(self.text), len(txt) - 1, 60)
+                    for ov in range(max_ov, 7, -1):
+                        if self.text[-ov:].lower() == txt[:ov].lower():
+                            txt = txt[ov:]
+                            break
                 if first_cjk or second_cjk:
                     self.text += txt
                 else:
                     self.text += ' ' + txt
+
         self.prob = prob
 
         self.translation = translation

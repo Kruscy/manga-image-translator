@@ -64,6 +64,15 @@ class TranslationInterrupt(Exception):
     """
     pass
 
+_OCR_GARBAGE_RE = re.compile(
+    r'(?i)\b(the\s+text\s+(is|reads|says)|text\s+reads|it\s+says|'
+    r'the\s+words?\s+(is|are|reads?)|says\s+["“「]|text\s*:\s|'
+    r'the\s+sign\s+(reads?|says)|caption\s+reads?|label\s+reads?)\b'
+)
+
+def _is_ocr_garbage(text: str) -> bool:
+    return bool(_OCR_GARBAGE_RE.search(text))
+
 def load_dictionary(file_path):
     dictionary = []
     if file_path and os.path.exists(file_path):
@@ -196,8 +205,10 @@ def _force_merge_same_bubble_text_regions(
 ) -> List['TextBlock']:
     """
     Group TextBlocks by which bubble box their center falls in, then
-    force-merge all TextBlocks within the same bubble into one.
-    Prevents the same speech bubble from being rendered multiple times.
+    merge adjacent TextBlocks within the same bubble.
+    Blocks separated by a physical gap > 2.5× font size are kept as distinct
+    groups — this prevents UI/item windows from collapsing title + content
+    into one block while still merging multi-line speech bubbles correctly.
     """
     if not bubble_boxes or not text_regions:
         return text_regions
@@ -220,11 +231,36 @@ def _force_merge_same_bubble_text_regions(
     result = list(no_bubble)
     merged_count = 0
     for group in bubble_groups.values():
-        if len(group) > 1:
-            result.append(_merge_textblock_group(group))
-            merged_count += len(group) - 1
-        else:
+        if len(group) <= 1:
             result.extend(group)
+            continue
+        # Sort by vertical center position
+        sorted_group = sorted(group, key=lambda r: r.center[1])
+        # Split into sub-groups: if physical gap between consecutive blocks
+        # exceeds 2.5× average font size, start a new sub-group.
+        sub_groups: list = []
+        current_sub = [sorted_group[0]]
+        for prev, curr in zip(sorted_group, sorted_group[1:]):
+            avg_fs = max((prev.font_size + curr.font_size) / 2, 10)
+            try:
+                prev_bottom = int(prev.lines[:, :, 1].max())
+                curr_top = int(curr.lines[:, :, 1].min())
+                gap = curr_top - prev_bottom
+            except Exception:
+                gap = curr.center[1] - prev.center[1] - avg_fs
+            if gap > 2.5 * avg_fs:
+                sub_groups.append(current_sub)
+                current_sub = [curr]
+            else:
+                current_sub.append(curr)
+        sub_groups.append(current_sub)
+
+        for sub in sub_groups:
+            if len(sub) > 1:
+                result.append(_merge_textblock_group(sub))
+                merged_count += len(sub) - 1
+            else:
+                result.extend(sub)
 
     if merged_count:
         logger.info(f'[TextlineMerge] Buborék-alapú összevonás: {merged_count} TextBlock eltávolítva')
@@ -585,6 +621,7 @@ class MangaTranslator:
         ctx.result_sub_folder = ''
 
         self._set_image_context(config, image)
+        ctx._input_filename = self._current_input_filename
         ctx.debug_folder = self._get_image_subfolder()
 
         if self.models_ttl == 0:
@@ -701,19 +738,28 @@ class MangaTranslator:
             ctx.result = ctx.upscaled
             return await self._revert_upscale(config, ctx)
 
-        # Mask refinement
-        if ctx.mask is None:
-            await self._report_progress('mask-generation')
-            try:
-                ctx.mask = await self._run_mask_refinement(config, ctx)
-            except Exception:
-                logger.error(f"Stage2 mask error:\n{traceback.format_exc()}")
-                if not self.ignore_errors:
-                    raise
-                ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros_like(ctx.img_rgb, dtype=np.uint8)[:, :, 0]
+        # Mask refinement — always run from filtered text_regions
+        await self._report_progress('mask-generation')
+        try:
+            ctx.mask = await self._run_mask_refinement(config, ctx)
+        except Exception:
+            logger.error(f"Stage2 mask error:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros_like(ctx.img_rgb, dtype=np.uint8)[:, :, 0]
 
-        # Ensure all detected regions (including OCR-failed) are covered by the mask
         self._apply_textlines_to_mask(config, ctx)
+
+        if self.verbose:
+            _dbg_dir = r'C:/Manga/result'
+            _dbg_base = os.path.splitext(self._current_input_filename)[0]
+            os.makedirs(_dbg_dir, exist_ok=True)
+            if ctx.mask is not None:
+                cv2.imwrite(os.path.join(_dbg_dir, f'{_dbg_base}_mask_final.png'), ctx.mask)
+                masked_vis = ctx.img_rgb.copy()
+                masked_vis[ctx.mask > 127] = [255, 0, 255]
+                cv2.imwrite(os.path.join(_dbg_dir, f'{_dbg_base}_inpaint_input.png'),
+                            cv2.cvtColor(masked_vis, cv2.COLOR_RGB2BGR))
 
         # Inpainting
         await self._report_progress('inpainting')
@@ -725,6 +771,10 @@ class MangaTranslator:
                 raise
             ctx.img_inpainted = ctx.img_rgb
         ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
+
+        if self.verbose:
+            cv2.imwrite(os.path.join(_dbg_dir, f'{_dbg_base}_inpainted.png'),
+                        cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR))
 
         # Rendering
         await self._report_progress('rendering')
@@ -772,14 +822,24 @@ class MangaTranslator:
             ctx.text_regions = [r for r in ctx.text_regions if r.translation]
             contexts.append(ctx)
 
-        # Mask refinement per image
+        # Mask refinement per image — always run from filtered text_regions
+        if self.verbose:
+            _dbg_dir = r'C:/Manga/result'
+            os.makedirs(_dbg_dir, exist_ok=True)
         for ctx in contexts:
-            if ctx.mask is None:
-                try:
-                    ctx.mask = await self._run_mask_refinement(config, ctx)
-                except Exception:
-                    ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros(ctx.img_rgb.shape[:2], dtype=np.uint8)
+            try:
+                ctx.mask = await self._run_mask_refinement(config, ctx)
+            except Exception:
+                ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros(ctx.img_rgb.shape[:2], dtype=np.uint8)
             self._apply_textlines_to_mask(config, ctx)
+            if self.verbose:
+                ctx._dbg_base = os.path.splitext(getattr(ctx, '_input_filename', 'unknown'))[0]
+                if ctx.mask is not None:
+                    cv2.imwrite(os.path.join(_dbg_dir, f'{ctx._dbg_base}_mask_final.png'), ctx.mask)
+                    masked_vis = ctx.img_rgb.copy()
+                    masked_vis[ctx.mask > 127] = [255, 0, 255]
+                    cv2.imwrite(os.path.join(_dbg_dir, f'{ctx._dbg_base}_inpaint_input.png'),
+                                cv2.cvtColor(masked_vis, cv2.COLOR_RGB2BGR))
 
         # Batch GPU inpainting
         imgs = [ctx.img_rgb for ctx in contexts]
@@ -797,6 +857,9 @@ class MangaTranslator:
         result_contexts = []
         for ctx, img_inpainted in zip(contexts, inpainted):
             ctx.img_inpainted = img_inpainted
+            if self.verbose and hasattr(ctx, '_dbg_base'):
+                cv2.imwrite(os.path.join(_dbg_dir, f'{ctx._dbg_base}_inpainted.png'),
+                            cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR))
             ctx.gimp_mask = np.dstack((cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR), ctx.mask))
             try:
                 ctx.img_rendered = await self._run_text_rendering(config, ctx)
@@ -962,18 +1025,17 @@ class MangaTranslator:
         logger.info(f"fordítás request time: {time.time()-t0:.2f}s")
 
         # -- Mask refinement
-        # (Delayed to take advantage of the region filtering done after ocr and translation)
-        if ctx.mask is None:
-            await self._report_progress('mask-generation')
-            try:
-                ctx.mask = await self._run_mask_refinement(config, ctx)
-            except Exception as e:  
-                logger.error(f"Error during mask-generation:\n{traceback.format_exc()}")  
-                if not self.ignore_errors:  
-                    raise 
-                ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros_like(ctx.img_rgb, dtype=np.uint8)[:,:,0] # Fallback to raw mask or empty mask
+        # Always regenerate mask from filtered text_regions so face/eye false positives
+        # that were filtered by ignore_bubble / min_text_length are never masked.
+        await self._report_progress('mask-generation')
+        try:
+            ctx.mask = await self._run_mask_refinement(config, ctx)
+        except Exception as e:
+            logger.error(f"Error during mask-generation:\n{traceback.format_exc()}")
+            if not self.ignore_errors:
+                raise
+            ctx.mask = ctx.mask_raw if ctx.mask_raw is not None else np.zeros_like(ctx.img_rgb, dtype=np.uint8)[:,:,0]
 
-        # Ensure all detected regions (including OCR-failed) are covered by the mask
         self._apply_textlines_to_mask(config, ctx)
 
         if self.verbose and ctx.mask is not None:
@@ -981,6 +1043,17 @@ class MangaTranslator:
                                                           self.device, self.verbose)
             cv2.imwrite(self._result_path('inpaint_input.png'), cv2.cvtColor(inpaint_input_img, cv2.COLOR_RGB2BGR))
             cv2.imwrite(self._result_path('mask_final.png'), ctx.mask)
+
+        if self.verbose and ctx.mask is not None:
+            _dbg_dir = r'C:/Manga/result'
+            _dbg_base = os.path.splitext(self._current_input_filename)[0]
+            os.makedirs(_dbg_dir, exist_ok=True)
+            cv2.imwrite(os.path.join(_dbg_dir, f'{_dbg_base}_mask_final.png'), ctx.mask)
+            masked_vis = ctx.img_rgb.copy()
+            masked_vis[ctx.mask > 127] = [255, 0, 255]
+            cv2.imwrite(os.path.join(_dbg_dir, f'{_dbg_base}_inpaint_input.png'),
+                        cv2.cvtColor(masked_vis, cv2.COLOR_RGB2BGR))
+
         logger.info(f"maszkolás request time: {time.time()-t0:.2f}s")
         
 
@@ -1005,6 +1078,16 @@ class MangaTranslator:
             except Exception as e:
                 logger.error(f"Error saving inpainted.png debug image: {e}")
                 logger.debug(f"Exception details: {traceback.format_exc()}")
+
+        if self.verbose:
+            try:
+                _dbg_dir = r'C:/Manga/result'
+                _dbg_base = os.path.splitext(self._current_input_filename)[0]
+                cv2.imwrite(os.path.join(_dbg_dir, f'{_dbg_base}_inpainted.png'),
+                            cv2.cvtColor(ctx.img_inpainted, cv2.COLOR_RGB2BGR))
+            except Exception:
+                pass
+
         logger.info(f"inpainting request time: {time.time()-t0:.2f}s")
         
         # -- Rendering
@@ -1395,6 +1478,11 @@ class MangaTranslator:
             elif 'MANGA_OCR_RESULT_DIR' in os.environ:
                 del os.environ['MANGA_OCR_RESULT_DIR']
 
+        # Tag all regions with primary source before secondary may override
+        for tl in textlines:
+            if not hasattr(tl, '_ocr_source'):
+                tl._ocr_source = str(config.ocr.ocr.value)
+
         # -- Secondary OCR comparison (optional)
         if config.ocr.secondary_ocr and config.ocr.secondary_ocr != config.ocr.ocr:
             textlines = await self._run_secondary_ocr_and_merge(config, ctx, textlines)
@@ -1436,6 +1524,7 @@ class MangaTranslator:
                     new_score = self._ocr_score(tl.text, tl.prob)
                     if tl.text.strip() and new_score > orig_score:
                         logger.info(f'[OCR] Tertiary override: {repr(orig_text)} (score={orig_score:.1f}) → {repr(tl.text)} (score={new_score:.1f})')
+                        tl._ocr_source = str(config.ocr.tertiary_ocr.value)
                     else:
                         tl.text, tl.prob = orig_text, orig_prob
 
@@ -1447,6 +1536,15 @@ class MangaTranslator:
                 if config.render.font_color_bg:
                     textline.bg_r, textline.bg_g, textline.bg_b = config.render.font_color_bg
                 new_textlines.append(textline)
+
+        # Save color-coded debug image when secondary or tertiary OCR is active
+        has_multi_ocr = (
+            (config.ocr.secondary_ocr and config.ocr.secondary_ocr != config.ocr.ocr) or
+            (config.ocr.tertiary_ocr and config.ocr.tertiary_ocr.value != 'none')
+        )
+        if self.verbose and has_multi_ocr:
+            self._save_ocr_sources_debug(ctx.img_rgb, new_textlines, config)
+
         return new_textlines
 
     def _save_ocr_region_debug(self, img_rgb: np.ndarray, textlines, label: str = ''):
@@ -1472,6 +1570,53 @@ class MangaTranslator:
         out_path = os.path.join(out_dir, f'{base}_ocr_debug{suffix}{ext or ".png"}')
         cv2.imwrite(out_path, overview_bgr)
         logger.info(f'[OCR debug] {len(textlines)} régiót jelöltem → {out_path}')
+
+    def _save_ocr_sources_debug(self, img_rgb: np.ndarray, textlines, config) -> None:
+        """Save color-coded debug image showing which OCR model found each region.
+        Green = primary, Blue = secondary, Orange = tertiary."""
+        _SOURCE_COLORS = {
+            str(config.ocr.ocr.value):                               (0, 200, 0),    # green  = primary
+            str(config.ocr.secondary_ocr.value) if config.ocr.secondary_ocr else '': (80, 80, 255),  # blue = secondary
+            str(config.ocr.tertiary_ocr.value) if config.ocr.tertiary_ocr else '':   (0, 165, 255),  # orange = tertiary
+        }
+        _LEGEND = {
+            str(config.ocr.ocr.value): 'P',
+            str(config.ocr.secondary_ocr.value) if config.ocr.secondary_ocr else '': 'S',
+            str(config.ocr.tertiary_ocr.value) if config.ocr.tertiary_ocr else '':   'T',
+        }
+
+        out_dir = r'C:/Manga/result'
+        os.makedirs(out_dir, exist_ok=True)
+
+        overview = img_rgb.copy()
+        for tl in textlines:
+            source = getattr(tl, '_ocr_source', str(config.ocr.ocr.value))
+            color = _SOURCE_COLORS.get(source, (200, 200, 200))
+            tag = _LEGEND.get(source, '?')
+            cv2.polylines(overview, [tl.pts], True, color, 2)
+            cx = int(tl.pts[:, 0].mean())
+            cy = int(tl.pts[:, 1].mean())
+            label = f'{tag}:{tl.text[:12]}' if tl.text else tag
+            cv2.putText(overview, label, (cx - 6, cy + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        # Legend box
+        legend_items = [
+            (f'P={config.ocr.ocr.value}', (0, 200, 0)),
+        ]
+        if config.ocr.secondary_ocr:
+            legend_items.append((f'S={config.ocr.secondary_ocr.value}', (80, 80, 255)))
+        if config.ocr.tertiary_ocr and config.ocr.tertiary_ocr.value != 'none':
+            legend_items.append((f'T={config.ocr.tertiary_ocr.value}', (0, 165, 255)))
+        for i, (text, color) in enumerate(legend_items):
+            cv2.putText(overview, text, (8, 22 + i * 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+
+        overview_bgr = cv2.cvtColor(overview, cv2.COLOR_RGB2BGR)
+        base, ext = os.path.splitext(self._current_input_filename)
+        out_path = os.path.join(out_dir, f'{base}_ocr_sources{ext or ".png"}')
+        cv2.imwrite(out_path, overview_bgr)
+        logger.info(f'[OCR sources debug] {len(textlines)} régió → {out_path}')
 
     def _ocr_score(self, text: str, prob: float = 1.0) -> float:
         """Score an OCR result: longer, cleaner text with higher confidence wins."""
@@ -1501,6 +1646,16 @@ class MangaTranslator:
 
         secondary_save = {id(tl): (tl.text, tl.prob) for tl in ctx.textlines}
 
+        def _char_similarity(a: str, b: str) -> float:
+            """Jaccard similarity on lowercase alphanumeric chars — catches hallucination."""
+            a_set = set(c.lower() for c in a if c.isalnum())
+            b_set = set(c.lower() for c in b if c.isalnum())
+            if not a_set and not b_set:
+                return 1.0
+            if not a_set or not b_set:
+                return 0.0
+            return len(a_set & b_set) / len(a_set | b_set)
+
         # Merge: restore primary results and compare
         any_diff = False
         for tl in ctx.textlines:
@@ -1509,6 +1664,17 @@ class MangaTranslator:
 
             p_score = self._ocr_score(p_text, p_prob)
             s_score = self._ocr_score(s_text, s_prob)
+
+            # Hallucination guard: if both models returned text but they share
+            # very few characters, the primary (VL model) likely hallucinated.
+            if p_text and s_text and p_text != s_text:
+                sim = _char_similarity(p_text, s_text)
+                if sim < 0.25:
+                    p_score *= 0.6
+                    logger.info(
+                        f'[OCR] Hallucination guard: sim={sim:.2f} < 0.25 → '
+                        f'primary penalized: {repr(p_text)} score→{p_score:.1f}'
+                    )
 
             if p_text != s_text:
                 any_diff = True
@@ -1522,9 +1688,11 @@ class MangaTranslator:
             if p_score >= s_score:
                 tl.text = p_text
                 tl.prob = p_prob
+                tl._ocr_source = str(config.ocr.ocr.value)
             else:
                 tl.text = s_text
                 tl.prob = s_prob
+                tl._ocr_source = str(config.ocr.secondary_ocr.value)
 
         if not any_diff:
             logger.info('[OCR] Both OCR models produced identical results for all regions.')
@@ -1659,6 +1827,7 @@ class MangaTranslator:
             
             if len(region.text) < config.ocr.min_text_length \
                     or not is_valuable_text(region.text) \
+                    or _is_ocr_garbage(region.text) \
                     or (not config.translator.no_text_lang_skip and langcodes.tag_distance(region.source_lang, config.translator.target_lang) == 0):
                 if region.text.strip():
                     logger.info(f'Filtered out: {region.text}')
@@ -1666,6 +1835,8 @@ class MangaTranslator:
                         logger.info('Reason: Text length is less than the minimum required length.')
                     elif not is_valuable_text(region.text):
                         logger.info('Reason: Text is not considered valuable.')
+                    elif _is_ocr_garbage(region.text):
+                        logger.info('Reason: OCR garbage pattern detected.')
                     elif langcodes.tag_distance(region.source_lang, config.translator.target_lang) == 0:
                         logger.info('Reason: Text language matches the target language and no_text_lang_skip is False.')
             else:
@@ -2137,17 +2308,31 @@ class MangaTranslator:
                 if mode == MaskFillMode.none:
                     pass
                 elif mode == MaskFillMode.character:
-                    roi = ctx.img_rgb[y1:y2, x1:x2]
+                    img_h, img_w = ctx.img_rgb.shape[:2]
+                    pad = 6
+                    px1 = max(0, x1 - pad); py1 = max(0, y1 - pad)
+                    px2 = min(img_w, x2 + pad); py2 = min(img_h, y2 + pad)
+                    roi = ctx.img_rgb[py1:py2, px1:px2]
                     if roi.size == 0:
                         continue
                     roi_gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-                    fg = region.fg_colors
-                    fg_lum = 0.2126 * fg[0] + 0.7152 * fg[1] + 0.0722 * fg[2]
-                    text_px = (roi_gray < 128).astype(np.uint8) * 255 if fg_lum < 128 \
-                              else (roi_gray > 128).astype(np.uint8) * 255
-                    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                    otsu_thresh, thresh_otsu = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                    # Minority class = text (text covers less area than background)
+                    bright_ratio = float(np.count_nonzero(thresh_otsu)) / max(thresh_otsu.size, 1)
+                    text_px = thresh_otsu if bright_ratio < 0.5 else cv2.bitwise_not(thresh_otsu)
+                    # Also catch dark outline pixels (white fill + black stroke on medium bg).
+                    roi_median = float(np.median(roi_gray))
+                    if roi_median > 50:
+                        outline_thresh = min(40, int(roi_median * 0.35))
+                        outline_px = (roi_gray < outline_thresh).astype(np.uint8) * 255
+                        text_px = cv2.bitwise_or(text_px, outline_px)
+                    # Use BACKGROUND-only std (exclude text pixels) to detect complex art bg.
+                    bg_pixels = roi_gray[text_px == 0]
+                    bg_std = float(np.std(bg_pixels.astype(np.float32))) if bg_pixels.size > 10 else 0.0
+                    kern_size = 5 if bg_std > 40 else 11
+                    kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kern_size, kern_size))
                     text_px = cv2.dilate(text_px, kern)
-                    ctx.mask[y1:y2, x1:x2] = np.maximum(ctx.mask[y1:y2, x1:x2], text_px)
+                    ctx.mask[py1:py2, px1:px2] = np.maximum(ctx.mask[py1:py2, px1:px2], text_px)
                 else:  # bbox (default)
                     cv2.rectangle(ctx.mask, (x1, y1), (x2, y2), 255, -1)
             except Exception:
@@ -2160,12 +2345,43 @@ class MangaTranslator:
     async def _run_inpainting(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("inpainting", config.inpainter.inpainter)] = current_time
+        h, w = ctx.img_rgb.shape[:2]
+        if h > w * 3 and ctx.text_regions:
+            return await self._run_inpainting_per_region(config, ctx)
         return await dispatch_inpainting(config.inpainter.inpainter, ctx.img_rgb, ctx.mask, config.inpainter, config.inpainter.inpainting_size, self.device,
                                          self.verbose)
+
+    async def _run_inpainting_per_region(self, config: Config, ctx: Context):
+        """Per-region inpainting for tall pages (webtoon). Each region gets its own
+        LaMa call with padding for context, avoiding downscale quality loss."""
+        result = ctx.img_rgb.copy()
+        h, w = ctx.img_rgb.shape[:2]
+        for region in ctx.text_regions:
+            x1, y1, x2, y2 = [int(v) for v in region.xyxy]
+            rw, rh = x2 - x1, y2 - y1
+            pad = max(rw, rh, 60)
+            px1 = max(0, x1 - pad);  py1 = max(0, y1 - pad)
+            px2 = min(w, x2 + pad);  py2 = min(h, y2 + pad)
+            crop_mask = ctx.mask[py1:py2, px1:px2]
+            if not crop_mask.any():
+                continue
+            crop_img = result[py1:py2, px1:px2]
+            inpainted = await dispatch_inpainting(
+                config.inpainter.inpainter, crop_img, crop_mask,
+                config.inpainter, config.inpainter.inpainting_size,
+                self.device, False)
+            mask_bool = crop_mask > 127
+            dst = result[py1:py2, px1:px2]
+            dst[mask_bool] = inpainted[mask_bool]
+            result[py1:py2, px1:px2] = dst
+        return result
 
     async def _run_text_rendering(self, config: Config, ctx: Context):
         current_time = time.time()
         self._model_usage_timestamps[("rendering", config.render.renderer)] = current_time
+        img_width = ctx.img_inpainted.shape[1]
+        base_max = config.render.max_font_size or 28
+        effective_max = round(base_max * img_width / 800)
         if config.render.renderer == Renderer.none:
             output = ctx.img_inpainted
         # manga2eng currently only supports horizontal left to right rendering
@@ -2174,13 +2390,16 @@ class MangaTranslator:
             if config.render.renderer == Renderer.manga2EngPillow:
                 output = await dispatch_eng_render_pillow(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing)
             else:
-                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing, font_size_maximum=config.render.max_font_size)
+                output = await dispatch_eng_render(ctx.img_inpainted, ctx.img_rgb, ctx.text_regions, _font, config.render.line_spacing,
+                                                   font_size_maximum=effective_max,
+                                                   horror_font_path=config.render.horror_font_path,
+                                                   cute_font_path=config.render.cute_font_path)
         else:
             _font = config.render.font_path or self.font_path
             output = await dispatch_rendering(ctx.img_inpainted, ctx.text_regions, _font, config.render.font_size,
                                               config.render.font_size_offset,
                                               config.render.font_size_minimum, not config.render.no_hyphenation, ctx.render_mask, config.render.line_spacing,
-                                              font_size_maximum=config.render.max_font_size)
+                                              font_size_maximum=effective_max)
         return output
 
     def _result_path(self, path: str) -> str:
